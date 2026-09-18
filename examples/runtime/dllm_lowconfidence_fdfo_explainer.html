@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LowConfidence 与 FDFO：dLLM 调度原理课</title>
+  <style>
+    :root {
+      --bg: #0b0d12;
+      --bg-2: #11151e;
+      --card: #161b26;
+      --line: #2a3142;
+      --text: #e8eaef;
+      --muted: #9aa3b5;
+      --orange: #ff7a3d;
+      --green: #3dd68c;
+      --red: #ff5d6c;
+      --yellow: #f5c542;
+      --blue: #6cb6ff;
+      --purple: #b794f6;
+      --mask: #2a3142;
+      --slot: #1c2330;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", "Hiragino Sans GB", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1a140e 0%, var(--bg) 45%);
+      color: var(--text);
+      line-height: 1.65;
+    }
+    header.hero {
+      padding: 48px 24px 28px;
+      max-width: 1080px;
+      margin: 0 auto;
+    }
+    .kicker {
+      color: var(--orange);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    h1 { font-size: 34px; line-height: 1.25; margin: 8px 0 12px; }
+    h2 { font-size: 22px; margin: 0 0 10px; }
+    h3 { font-size: 16px; margin: 0 0 8px; color: var(--text); }
+    p { color: var(--muted); }
+    a { color: var(--blue); }
+    .hero-lead { font-size: 17px; max-width: 760px; }
+    nav.toc {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(11,13,18,0.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 16px;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+    }
+    nav.toc a {
+      white-space: nowrap;
+      text-decoration: none;
+      color: var(--muted);
+      font-size: 13px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+    }
+    nav.toc a:hover { color: var(--text); border-color: var(--line); }
+    main { max-width: 1080px; margin: 0 auto; padding: 12px 24px 80px; }
+    section.lesson {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 24px;
+      margin: 18px 0;
+    }
+    .one-liner {
+      background: #1f160f;
+      border: 1px solid #5a341d;
+      color: #ffd4bc;
+      padding: 14px 16px;
+      border-radius: 12px;
+      font-size: 16px;
+    }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } h1 { font-size: 26px; } }
+    .callout {
+      border-left: 3px solid var(--orange);
+      background: #1a1f2b;
+      padding: 10px 14px;
+      border-radius: 0 10px 10px 0;
+      color: var(--text);
+      margin: 12px 0;
+    }
+    .callout.green { border-left-color: var(--green); }
+    .callout.red { border-left-color: var(--red); }
+    .callout.blue { border-left-color: var(--blue); }
+    .tokens {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .tok {
+      min-width: 72px;
+      text-align: center;
+      padding: 10px 8px 8px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: var(--slot);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      position: relative;
+    }
+    .tok .idx {
+      position: absolute;
+      top: 4px;
+      left: 6px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .tok.mask { background: #202737; color: #8b95a8; }
+    .tok.unmask { background: #143326; border-color: #2e7a55; color: var(--green); }
+    .tok.pick { box-shadow: 0 0 0 2px var(--orange); }
+    .tok.fallback { box-shadow: 0 0 0 2px var(--yellow); }
+    .tok .conf {
+      margin-top: 8px;
+      height: 4px;
+      background: #2b3344;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .tok .conf > i {
+      display: block;
+      height: 100%;
+      background: var(--blue);
+    }
+    .tok .confval { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
+    button, select {
+      background: #232a39;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button.primary { background: var(--orange); color: #1a0d06; border-color: #ff9a6b; font-weight: 700; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+    pre {
+      background: #0e121a;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      overflow: auto;
+      font-size: 12.5px;
+      line-height: 1.5;
+      color: #d5dbe8;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .formula {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #0e121a;
+      padding: 12px 14px;
+      border-radius: 10px;
+      color: #d7deec;
+      font-size: 13px;
+    }
+    .gantt {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0e121a;
+      padding: 12px;
+    }
+    .gantt table { border-collapse: separate; border-spacing: 3px; width: 100%; min-width: 720px; }
+    .gantt th, .gantt td { font-size: 12px; text-align: center; }
+    .gantt th { color: var(--muted); font-weight: 500; }
+    .cell {
+      min-width: 42px;
+      height: 28px;
+      border-radius: 6px;
+      background: #1a2030;
+      color: #0b0d12;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .cell.idle { background: #1a2030; color: #445; font-weight: 500; }
+    .cell.wait { background: repeating-linear-gradient(135deg, #2a1d16, #2a1d16 6px, #3a281d 6px, #3a281d 12px); color: #c9a08a; font-weight: 600; }
+    .cell.A { background: var(--green); }
+    .cell.B { background: var(--yellow); }
+    .cell.C { background: var(--red); }
+    .cell.D { background: var(--blue); }
+    .cell.now { outline: 2px solid #fff; }
+    .stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 12px; }
+    @media (max-width: 860px) { .stat-row { grid-template-columns: 1fr 1fr; } }
+    .stat {
+      background: #0e121a;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .stat b { display: block; font-size: 20px; color: var(--text); }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .req-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #0e121a;
+    }
+    .pill {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 860px) { .state-grid { grid-template-columns: 1fr; } }
+    .compare-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      flex-wrap: wrap;
+    }
+    .step-log {
+      max-height: 180px;
+      overflow: auto;
+      font-size: 13px;
+      color: var(--muted);
+      background: #0e121a;
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+    }
+    .step-log div { margin: 4px 0; }
+    .ok { color: var(--green); }
+    .warn { color: var(--yellow); }
+    .bad { color: var(--red); }
+    footer { text-align: center; color: #667; font-size: 12px; padding-bottom: 40px; }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="kicker">SGLang PR #17770 · Diffusion LLM</div>
+    <h1>LowConfidence 在选 token，<br>FDFO 在拆掉「短板等待」</h1>
+    <p class="hero-lead">
+      这篇是一堂可动手的原理课。先搞清楚 <b style="color:var(--text)">Diffusion LLM 怎么一块一块去噪</b>，
+      再看 <b style="color:var(--text)">LowConfidence</b> 如何决定揭开哪些 <code>[MASK]</code>，
+      最后对比原来的<b style="color:var(--text)">同步锁步实现</b>和 <b style="color:var(--text)">FDFO（First Done First Out）</b>
+      怎样消灭队头阻塞。
+    </p>
+  </header>
+
+  <nav class="toc">
+    <a href="#s0">0. 一句话</a>
+    <a href="#s1">1. dLLM 块去噪</a>
+    <a href="#s2">2. LowConfidence</a>
+    <a href="#s3">3. 动手揭 token</a>
+    <a href="#s4">4. 原来的锁步</a>
+    <a href="#s5">5. 队头阻塞</a>
+    <a href="#s6">6. FDFO</a>
+    <a href="#s7">7. 对照动画</a>
+    <a href="#s8">8. 四个状态</a>
+    <a href="#s9">9. 对应代码</a>
+  </nav>
+
+  <main>
+    <section class="lesson" id="s0">
+      <h2>0. 先记住这一句</h2>
+      <div class="one-liner">
+        LowConfidence 是「这一块里哪些 MASK 可以变成真正 token」的<b>选词规则</b>；
+        FDFO 是「这一步算完要不要立刻把请求交还调度器」的<b>调度规则</b>。
+        两者正交：选词策略可以不变，只改调度，就能让快请求不再陪慢请求耗着。
+      </div>
+      <p>
+        PR <a href="https://github.com/sgl-project/sglang/pull/17770" target="_blank" rel="noreferrer">#17770</a>
+        当时把二者捆成 <code>LowConfidenceFDFO</code>。当前主线已经拆开：
+        <code>--dllm-algorithm LowConfidence</code> 管选词，
+        <code>--dllm-fdfo</code>（默认开）管调度。
+        原理仍是同一件事。
+      </p>
+    </section>
+
+    <section class="lesson" id="s1">
+      <h2>1. dLLM 不是从左到右吐 token</h2>
+      <div class="grid-2">
+        <div>
+          <h3>自回归 LLM</h3>
+          <p>每次 forward 只决定 <b style="color:var(--text)">下一个</b> token。生成 32 个字 ≈ 32 次 decode。</p>
+          <div class="tokens">
+            <div class="tok unmask">The</div>
+            <div class="tok unmask">cat</div>
+            <div class="tok pick">sat</div>
+            <div class="tok mask">?</div>
+            <div class="tok mask">?</div>
+          </div>
+        </div>
+        <div>
+          <h3>Diffusion LLM（LLaDA 这类）</h3>
+          <p>先铺一整块 <code>[MASK]</code>（LLaDA2 默认 <b style="color:var(--text)">block_size = 32</b>），每次 forward 同时看整块，按规则揭开若干位置，重复直到没有 MASK。</p>
+          <div class="tokens">
+            <div class="tok mask">MASK</div>
+            <div class="tok mask">MASK</div>
+            <div class="tok mask">MASK</div>
+            <div class="tok mask">MASK</div>
+            <div class="tok mask">MASK</div>
+          </div>
+        </div>
+      </div>
+      <div class="callout">
+        教学里我们用 <b>block_size = 8</b>，算法和 32 完全一样，只是格子更少、更好盯着看。
+        一次「去噪步」= 一次模型 forward + 一次按规则揭 MASK。
+      </div>
+    </section>
+
+    <section class="lesson" id="s2">
+      <h2>2. LowConfidence 算法：高置信就揭，否则揭最有把握的那一个</h2>
+      <p>对当前块里每个还是 MASK 的位置：</p>
+      <div class="formula">
+        x[i]          = argmax(logits[i])                 # 该位置最可能的 token<br>
+        p             = softmax(logits)<br>
+        conf[i]       = p[i, x[i]]                        # 这个预测有多自信<br>
+        conf[~mask]   = -inf                              # 已经揭开的位置不再改<br>
+        transfer      = conf &gt; threshold                  # 默认 threshold = 0.95<br>
+        if transfer 全 False:                             # 这一步谁都不够自信<br>
+            transfer[argmax(conf)] = True                 # 保底：揭开置信最高的 1 个
+      </div>
+      <div class="callout green">
+        所以「简单位置」可以一步揭好几个；「难位置」长期低于 0.95，每步只揭 1 个。
+        一块 8 个 MASK，最好 1 步结束，最坏 8 步（每步只揭 1 个）。这就是快慢分化的根源。
+      </div>
+      <p>对应实现就在 <code>python/sglang/srt/dllm/algorithm/low_confidence.py</code> 的 <code>step()</code>：它只改 <code>forward_batch.input_ids</code>，不负责调度。</p>
+    </section>
+
+    <section class="lesson" id="s3">
+      <h2>3. 动手：走一步 LowConfidence</h2>
+      <p>选一种请求画像，点「走一步」。橙框 = 超过阈值被揭开；黄框 = 触发了 top-1 保底。</p>
+      <div class="controls">
+        <label>请求画像
+          <select id="profile">
+            <option value="easy">A · 高置信（3 步揭完）</option>
+            <option value="mid">B · 中等（5 步揭完）</option>
+            <option value="hard">C · 长尾（8 步揭完，每步只揭 1 个）</option>
+          </select>
+        </label>
+        <button class="primary" id="stepBtn">走一步</button>
+        <button id="resetBtn">重置这块</button>
+        <span class="pill" id="stepLabel">step 0</span>
+        <span class="pill" id="ruleLabel">还没 forward</span>
+      </div>
+      <div class="tokens" id="block"></div>
+      <div class="legend">
+        <span><i class="dot" style="background:#2a3142"></i>MASK 未揭</span>
+        <span><i class="dot" style="background:var(--green)"></i>已揭开</span>
+        <span><i class="dot" style="background:var(--orange)"></i>本步 conf &gt; 0.95</span>
+        <span><i class="dot" style="background:var(--yellow)"></i>本步 top-1 保底</span>
+      </div>
+      <div class="step-log" id="lcLog"></div>
+    </section>
+
+    <section class="lesson" id="s4">
+      <h2>4. 原来的实现：选词循环关在 algorithm.run() 里</h2>
+      <p>
+        PR 之前（以及现在的 <code>--no-dllm-fdfo</code> 同步路径）把「把当前块去噪完」写成一个内层循环。
+        控制权要等 <b style="color:var(--text)">batch 里每一条请求的当前块都没有 MASK</b> 才还给调度器。
+      </p>
+      <pre>def _run_sync(...):                          # 现在的 base.py，语义等于原来的 LowConfidence.run
+    out = model_runner.forward(...)
+    for _ in range(block_size + 1):
+        done = self.step(...)                # LowConfidence 揭一批 MASK
+        if all(done):                        # ← 短板：必须全员完成
+            break
+        out = model_runner.forward(...)      # 快请求已经没 MASK 了，仍被带着再 forward
+    return 整块 token                        # 这时才回 scheduler，才提交 output</pre>
+      <div class="callout red">
+        <code>all(done)</code> 就是同步屏障。A 第 3 步已经揭完，仍要陪 C 再跑 5 次 forward；
+        A 的 token 也不能提交、不能开下一块、更不能把 GPU 槽位让给排队的 D。
+      </div>
+    </section>
+
+    <section class="lesson" id="s5">
+      <h2>5. 问题长什么样：队头阻塞（Head-of-Line Blocking）</h2>
+      <p>三个在跑、一个在排队。GPU 只有 3 个槽。A 快、C 慢。</p>
+      <div class="grid-2">
+        <div class="req-card">
+          <h3>同步 LowConfidence</h3>
+          <p>当前波必须跑 <code>max(3,5,8) = 8</code> 步。A、B 提前结束也出不去。D 只能等这一波全部提交之后再上。</p>
+          <p class="bad">A 的延迟 = 8（自己只要 3）<br>D 的开始时间 = 8</p>
+        </div>
+        <div class="req-card">
+          <h3>你马上会看到的 FDFO</h3>
+          <p>每 1 步都回调度器。A 第 3 步离开，D 立刻补位。C 继续慢慢揭，不再挡别人。</p>
+          <p class="ok">A 的延迟 = 3<br>D 的开始时间 = 3</p>
+        </div>
+      </div>
+      <div class="callout">
+        PR 在 H800 / LLaDA2.0-mini / GSM8K 上相对同步 LowConfidence：
+        BS=4 约 <b>2.4×</b>，BS=16 约 <b>4.1×</b>。
+        batch 越大，快慢差被放大得越厉害，FDFO 收益越大。
+      </div>
+    </section>
+
+    <section class="lesson" id="s6">
+      <h2>6. FDFO 怎么拆屏障：一步一调度</h2>
+      <pre>def _run_fdfo(...):
+    out = model_runner.forward(...)          # 只做 1 次
+    done = self.step(...)                    # 只揭 1 轮 MASK
+    accept_length = [block_size if d else 0 for d in done]
+    return 当前块快照, accept_length         # 立刻回 scheduler</pre>
+      <p>调度器看 <code>accept_length</code>：</p>
+      <ul style="color:var(--muted)">
+        <li><b style="color:var(--green)">= block_size</b>：这块已经没有 MASK（进入 step 时已完成，KV 是最终态）→ 提交 token，请求可开下一块或结束，槽位释放。</li>
+        <li><b style="color:var(--yellow)">= 0</b>：还没揭完 → 把半成品写入 <code>dllm_incomplete_ids</code>，下一轮带着半成品再来。</li>
+      </ul>
+      <div class="callout blue">
+        选词规则仍是 LowConfidence，一个 token 都没改。变的是：
+        <b>去噪循环从 kernel/algorithm 内层，搬到了 scheduler 外层。</b>
+        快请求「先做完就先出队」，所以叫 First Done First Out。
+      </div>
+    </section>
+
+    <section class="lesson" id="s7">
+      <h2>7. 对照动画：同一批请求，两种调度</h2>
+      <div class="compare-head">
+        <p>格子 = 一次 GPU forward。斜纹 = 已经揭完却被锁在 batch 里陪跑（浪费）。灰 = 空槽。</p>
+        <div class="controls">
+          <button class="primary" id="playBtn">播放一步</button>
+          <button id="playAllBtn">播放到结束</button>
+          <button id="simReset">重置时间线</button>
+          <span class="pill" id="tLabel">t = 0</span>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div>
+          <h3>同步 · 短板锁步</h3>
+          <div class="gantt" id="ganttSync"></div>
+        </div>
+        <div>
+          <h3>FDFO · 先完成先出队</h3>
+          <div class="gantt" id="ganttFdfo"></div>
+        </div>
+      </div>
+      <div class="stat-row">
+        <div class="stat"><b id="stMakespan">0 / 0</b><span>完成全部请求的步数（同步 / FDFO）</span></div>
+        <div class="stat"><b id="stWaste">0</b><span>同步模式浪费的陪跑格子</span></div>
+        <div class="stat"><b id="stA">8 → 3</b><span>请求 A 的完成时刻</span></div>
+        <div class="stat"><b id="stD">12 → 7</b><span>排队请求 D 的完成时刻</span></div>
+      </div>
+      <div class="step-log" id="simLog"></div>
+    </section>
+
+    <section class="lesson" id="s8">
+      <h2>8. 调度器每一轮怎么给请求分类</h2>
+      <p>PR 把每条请求在「这一次 forward 之后」分成四种去向。核心是：半成品不要当完成，完成了的不要继续占着当前块。</p>
+      <div class="state-grid">
+        <div class="req-card">
+          <span class="pill">1 · Complete Prefill</span>
+          <h3>当前块是 prompt 块，已经填完</h3>
+          <p>还没有生成新 token。用 <code>origin_ids</code> 推进 <code>fill_ids</code>，继续下一块 prompt，或转入 decode。</p>
+        </div>
+        <div class="req-card">
+          <span class="pill">2 · Incomplete Decode</span>
+          <h3>decode 块里还有 MASK</h3>
+          <p><code>accept_length = 0</code>。写入 <code>dllm_incomplete_ids</code>（半成品 token + 仍在的 MASK），下一 round 原样填回去继续揭。</p>
+        </div>
+        <div class="req-card">
+          <span class="pill">3 · Complete Decode，KV 还没落稳</span>
+          <h3>MASK 刚揭完，但缓存尚未按最终 token 提交</h3>
+          <p>PR 里仍走 incomplete 路径，避免用 MASK 块去当 prefix cache 的 key。当前主线会把未完成块的 KV 留下来复用，这是后续优化，语义不变。</p>
+        </div>
+        <div class="req-card">
+          <span class="pill">4 · Complete Decode，KV 已更新</span>
+          <h3>这块可以提交了</h3>
+          <p>把输出 append 到 <code>output_ids</code>，检查 EOS / 长度。没结束就追加下一块全新 MASK，进入下一 decode 块。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="lesson" id="s9">
+      <h2>9. 和仓库代码对上号</h2>
+      <div class="grid-2">
+        <div>
+          <h3>选词（不变）</h3>
+          <pre>low_confidence.py :: step()
+  x = argmax(logits)
+  conf = softmax(logits).gather(x)
+  conf = where(is_mask, conf, -inf)
+  transfer = conf &gt; 0.95
+  if 这一行全没过阈值:
+      transfer[argmax(conf)] = True
+  input_ids[transfer] = x[transfer]</pre>
+        </div>
+        <div>
+          <h3>调度（FDFO 改这里）</h3>
+          <pre>base.py
+  fdfo  → _run_fdfo：forward 1 次就返回
+  sync  → _run_sync：内层循环直到 all(done)
+
+scheduler mixin
+  accept_length == 0 → dllm_incomplete_ids
+  accept_length == block_size → 提交 / 结束 / 下一块</pre>
+        </div>
+      </div>
+      <div class="callout green">
+        回看 PR 标题 <b>first done first out</b>：不是改生成质量，是改「谁可以离开 batch」。
+        LowConfidence 决定<b>一块要跑多少步</b>；FDFO 决定<b>这些步要不要锁在一起跑</b>。
+      </div>
+    </section>
+  </main>
+  <footer>教学演示 · block_size=8、threshold=0.95 · 对应 sgl-project/sglang#17770 与当前 --dllm-fdfo 路径</footer>
+
+  <script>
+    const THRESHOLD = 0.95;
+    const TARGET = ["Paris", "is", "the", "capital", "of", "France", ".", "<eos>"];
+    const PROFILES = {
+      easy: [
+        [0.99, 0.97, 0.96, 0.81, 0.70, 0.55, 0.40, 0.22],
+        [null, null, null, 0.98, 0.96, 0.88, 0.60, 0.30],
+        [null, null, null, null, null, 0.97, 0.96, 0.95],
+      ],
+      mid: [
+        [0.96, 0.80, 0.70, 0.60, 0.40, 0.30, 0.22, 0.18],
+        [null, 0.97, 0.66, 0.58, 0.44, 0.33, 0.25, 0.20],
+        [null, null, 0.96, 0.62, 0.50, 0.36, 0.28, 0.21],
+        [null, null, null, 0.97, 0.96, 0.40, 0.30, 0.22],
+        [null, null, null, null, null, 0.97, 0.96, 0.95],
+      ],
+      hard: [
+        [0.80, 0.70, 0.60, 0.50, 0.45, 0.40, 0.30, 0.20],
+        [null, 0.78, 0.66, 0.55, 0.48, 0.41, 0.33, 0.22],
+        [null, null, 0.74, 0.58, 0.49, 0.42, 0.34, 0.23],
+        [null, null, null, 0.71, 0.52, 0.44, 0.35, 0.24],
+        [null, null, null, null, 0.69, 0.50, 0.38, 0.26],
+        [null, null, null, null, null, 0.64, 0.41, 0.28],
+        [null, null, null, null, null, null, 0.58, 0.31],
+        [null, null, null, null, null, null, null, 0.99],
+      ],
+    };
+
+    const lc = { profile: "easy", step: 0, unmasked: Array(8).fill(false) };
+
+    function pickTransfers(conf) {
+      const vals = conf.map((c, i) => (lc.unmasked[i] || c == null ? -Infinity : c));
+      const over = vals.map((c) => c > THRESHOLD);
+      const any = over.some(Boolean);
+      let fallback = -1;
+      if (!any) {
+        let best = -Infinity;
+        vals.forEach((c, i) => { if (c > best) { best = c; fallback = i; } });
+        if (fallback >= 0) over[fallback] = true;
+      }
+      return { over, fallback: any ? -1 : fallback };
+    }
+
+    function renderBlock(highlight) {
+      const el = document.getElementById("block");
+      const confRow = PROFILES[lc.profile][lc.step] || Array(8).fill(null);
+      el.innerHTML = TARGET.map((tok, i) => {
+        const opened = lc.unmasked[i];
+        const conf = confRow[i];
+        const cls = [
+          "tok",
+          opened ? "unmask" : "mask",
+          highlight && highlight.over[i] && highlight.fallback !== i ? "pick" : "",
+          highlight && highlight.fallback === i ? "fallback" : "",
+        ].join(" ");
+        const bar = opened || conf == null ? 0 : Math.round(conf * 100);
+        return `<div class="${cls}">
+          <span class="idx">${i}</span>
+          <div>${opened ? tok : "MASK"}</div>
+          <div class="conf"><i style="width:${bar}%"></i></div>
+          <div class="confval">${opened ? "已揭开" : (conf == null ? "—" : conf.toFixed(2))}</div>
+        </div>`;
+      }).join("");
+    }
+
+    function logLC(msg) {
+      const box = document.getElementById("lcLog");
+      const div = document.createElement("div");
+      div.innerHTML = msg;
+      box.prepend(div);
+    }
+
+    function resetLC() {
+      lc.step = 0;
+      lc.unmasked = Array(8).fill(false);
+      document.getElementById("stepLabel").textContent = "step 0";
+      document.getElementById("ruleLabel").textContent = "还没 forward";
+      document.getElementById("lcLog").innerHTML = "点「走一步」：模型会给每个 MASK 一个置信度，再按阈值揭开。";
+      document.getElementById("stepBtn").disabled = false;
+      renderBlock(null);
+    }
+
+    document.getElementById("profile").addEventListener("change", (e) => {
+      lc.profile = e.target.value;
+      resetLC();
+    });
+    document.getElementById("resetBtn").addEventListener("click", resetLC);
+    document.getElementById("stepBtn").addEventListener("click", () => {
+      const conf = PROFILES[lc.profile][lc.step];
+      if (!conf) return;
+      const { over, fallback } = pickTransfers(conf);
+      const names = over.map((v, i) => v ? TARGET[i] : null).filter(Boolean);
+      over.forEach((v, i) => { if (v) lc.unmasked[i] = true; });
+      renderBlock({ over, fallback });
+      const rule = fallback >= 0
+        ? `没有任何位置 ≥ 0.95，触发 top-1 保底：揭开位置 ${fallback}（${TARGET[fallback]}）`
+        : `置信度 > 0.95 的位置一并揭开：${names.join(", ")}`;
+      document.getElementById("ruleLabel").textContent = rule;
+      logLC(`<span class="ok">step ${lc.step + 1}</span> · ${rule} · 还剩 ${lc.unmasked.filter(x => !x).length} 个 MASK`);
+      lc.step += 1;
+      document.getElementById("stepLabel").textContent = `step ${lc.step}`;
+      if (lc.unmasked.every(Boolean)) {
+        document.getElementById("stepBtn").disabled = true;
+        logLC(`<span class="ok">这块完成。</span> 高置信请求步数少；长尾请求接近 block_size 步。`);
+      }
+    });
+    resetLC();
+
+    /* ---------- Sync vs FDFO timeline ---------- */
+    const NEED = { A: 3, B: 5, C: 8, D: 4 };
+    const TMAX = 12;
+    const SLOTS = 3;
+
+    function simulateSync() {
+      const rows = Array.from({ length: SLOTS }, () => Array(TMAX).fill(null));
+      const events = [];
+      for (let t = 0; t < 8; t++) {
+        rows[0][t] = t >= NEED.A ? { id: "A", wait: true } : { id: "A", wait: false };
+        rows[1][t] = t >= NEED.B ? { id: "B", wait: true } : { id: "B", wait: false };
+        rows[2][t] = { id: "C", wait: false };
+      }
+      events.push("t=1..8：A/B/C 锁在同一波。A 实际 3 步完成，却要陪跑到 8。D 还在排队。");
+      for (let t = 8; t < 12; t++) {
+        rows[0][t] = { id: "D", wait: false };
+        events.push(`t=${t + 1}：上一波终于提交，D 才开始。`);
+      }
+      return { rows, events, done: { A: 8, B: 8, C: 8, D: 12 }, waste: (8 - 3) + (8 - 5), makespan: 12 };
+    }
+
+    function simulateFdfo() {
+      const rows = Array.from({ length: SLOTS }, () => Array(TMAX).fill(null));
+      const progress = { A: 0, B: 0, C: 0, D: 0 };
+      const finishedAt = {};
+      const events = [];
+      // Sticky slots: 0 holds A then D, 1 holds B, 2 holds C.
+      let slots = ["A", "B", "C"];
+      const waiting = ["D"];
+      for (let t = 0; t < TMAX; t++) {
+        slots.forEach((id, s) => {
+          if (!id) return;
+          rows[s][t] = { id, wait: false };
+          progress[id] += 1;
+        });
+        const justDone = [];
+        slots = slots.map((id) => {
+          if (!id) return null;
+          if (progress[id] >= NEED[id]) {
+            finishedAt[id] = t + 1;
+            justDone.push({ id, slot: slots.indexOf(id) });
+            return null;
+          }
+          return id;
+        });
+        if (justDone.length) {
+          events.push(`t=${t + 1}：${justDone.map((x) => x.id).join(",")} 当前块完成，立刻出队。`);
+        }
+        slots = slots.map((id) => {
+          if (id || !waiting.length) return id;
+          const nxt = waiting.shift();
+          events.push(`t=${t + 1} 结束后：空槽补上 ${nxt}。`);
+          return nxt;
+        });
+        if (Object.keys(finishedAt).length === 4) break;
+      }
+      return { rows, events, done: finishedAt, waste: 0, makespan: Math.max(...Object.values(finishedAt)) };
+    }
+
+    const SYNC = simulateSync();
+    const FDFO = simulateFdfo();
+    let tNow = 0;
+    let timer = null;
+
+    function paintGantt(el, sim, t) {
+      const names = ["槽 0", "槽 1", "槽 2"];
+      let html = "<table><thead><tr><th></th>";
+      for (let i = 1; i <= TMAX; i++) html += `<th>${i}</th>`;
+      html += "</tr></thead><tbody>";
+      sim.rows.forEach((row, s) => {
+        html += `<tr><th>${names[s]}</th>`;
+        row.forEach((cell, i) => {
+          const now = i === t - 1 ? " now" : "";
+          if (!cell || i >= t) {
+            html += `<td><div class="cell idle${now}">${i < t ? "·" : ""}</div></td>`;
+          } else if (cell.wait) {
+            html += `<td><div class="cell wait${now}">${cell.id}锁</div></td>`;
+          } else {
+            html += `<td><div class="cell ${cell.id}${now}">${cell.id}</div></td>`;
+          }
+        });
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      el.innerHTML = html;
+    }
+
+    function renderSim() {
+      paintGantt(document.getElementById("ganttSync"), SYNC, tNow);
+      paintGantt(document.getElementById("ganttFdfo"), FDFO, tNow);
+      document.getElementById("tLabel").textContent = `t = ${tNow}`;
+      document.getElementById("stMakespan").textContent = `${SYNC.makespan} / ${FDFO.makespan}`;
+      document.getElementById("stWaste").textContent = String(SYNC.waste);
+      document.getElementById("stA").textContent = `${SYNC.done.A} → ${FDFO.done.A}`;
+      document.getElementById("stD").textContent = `${SYNC.done.D} → ${FDFO.done.D}`;
+      const box = document.getElementById("simLog");
+      const notes = [];
+      if (tNow === 0) notes.push("从 t=0 开始。两边初始 batch 都是 A、B、C，D 在等待队列。");
+      if (tNow === 3) notes.push("<span class='ok'>FDFO：A 第 3 步揭完，本步结束后出队。</span> 同步侧 A 变成斜纹——人已经做完，还得陪 C。");
+      if (tNow === 4) notes.push("<span class='ok'>FDFO：D 补进 A 腾出的槽 0，开始自己的 4 步。</span> 同步侧 D 仍在队列里干等。");
+      if (tNow === 5) notes.push("<span class='ok'>FDFO：B 也完成。</span> 同步侧 B 还要再陪 C 三步。");
+      if (tNow === 8) notes.push("<span class='bad'>同步：C 终于结束，这一波才提交；D 现在才开始。</span> FDFO 的 C 也在此刻结束，但 D 早已跑完一大半。");
+      if (tNow === 12) notes.push("<span class='warn'>同步的 D 才结束。</span> 全程 12 步 vs FDFO 8 步；浪费陪跑格子 8-3+8-5=8。");
+      box.innerHTML = notes.join("<br>") || `播放到 t=${tNow}。注意同步图里的斜纹：那就是队头阻塞。`;
+    }
+
+    function stepSim() {
+      if (tNow >= TMAX) return;
+      tNow += 1;
+      renderSim();
+    }
+    document.getElementById("playBtn").addEventListener("click", () => {
+      if (timer) { clearInterval(timer); timer = null; }
+      stepSim();
+    });
+    document.getElementById("playAllBtn").addEventListener("click", () => {
+      if (timer) return;
+      timer = setInterval(() => {
+        if (tNow >= TMAX) { clearInterval(timer); timer = null; return; }
+        stepSim();
+      }, 450);
+    });
+    document.getElementById("simReset").addEventListener("click", () => {
+      if (timer) { clearInterval(timer); timer = null; }
+      tNow = 0;
+      renderSim();
+    });
+    renderSim();
+  </script>
+</body>
+</html>
