@@ -164,7 +164,7 @@ class JointThreshold(DllmAlgorithm):
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         if self._use_shared_state:
             return self._step_vectorized_shared(
                 forward_batch=forward_batch, full_logits=full_logits, states=states
@@ -182,7 +182,7 @@ class JointThreshold(DllmAlgorithm):
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         shared = states[0]
         joint_threshold_update_step_vectorized(
             input_ids_1d=forward_batch.input_ids,
@@ -197,14 +197,14 @@ class JointThreshold(DllmAlgorithm):
             max_post_edit_steps=self.max_post_edit_steps,
             penalty_lambda=self.penalty_lambda,
         )
-        return shared["finished"].tolist()
+        return shared["finished"]
 
     def _step_vectorized_fdfo(
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         # FDFO carries per-request dict states across rounds (stashed on the
         # request, re-mixed with fresh rows each round), so gather them into
         # batched tensors for this round's single step, then scatter the results
@@ -239,14 +239,14 @@ class JointThreshold(DllmAlgorithm):
         for i, state in enumerate(states):
             state["finished"] = done[i]
             state["post_edit_steps"] = new_post_edit_steps[i]
-        return done
+        return finished
 
     def _step_per_row(
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         batch_size = forward_batch.batch_size
         done: List[bool] = []
 
@@ -312,7 +312,9 @@ class JointThreshold(DllmAlgorithm):
             # block's final KV: emit it now rather than after an extra forward.
             done.append(state["finished"])
 
-        return done
+        return torch.tensor(
+            done, dtype=torch.bool, device=forward_batch.input_ids.device
+        )
 
 
 Algorithm = JointThreshold

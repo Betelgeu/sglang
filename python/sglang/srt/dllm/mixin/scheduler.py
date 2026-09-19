@@ -4,10 +4,13 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -16,10 +19,71 @@ from sglang.srt.runtime_context import get_exec, get_schedule
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
 
 
 class SchedulerDllmMixin:
+    def run_batch_dllm_overlap(self: Scheduler, batch: ScheduleBatch):
+        """Launch first forward; resume denoising after the previous result commits.
+
+        Called inside run_batch's existing forward stream/isolation context.
+        Pending-request filtering guarantees the two batches are independent.
+        """
+        worker = self.tp_worker
+        forward_batch = worker.prepare_dllm_batch(batch)
+        algorithm = worker.dllm_algorithm
+        runner = worker.model_runner
+        states = (
+            algorithm.init_fdfo_states(
+                forward_batch, [req.dllm_algo_state for req in batch.reqs]
+            )
+            if algorithm.fdfo
+            else None
+        )
+        out = runner.forward(forward_batch, pp_proxy_tensors=None)
+        result = GenerationBatchResult(
+            logits_output=out.logits_output,
+            dllm_algo_state=states,
+            can_run_cuda_graph=out.can_run_graph,
+        )
+
+        def finish():
+            blocks = forward_batch.input_ids.view(-1, algorithm.block_size)
+            if algorithm.fdfo:
+                done = algorithm.step(
+                    forward_batch, out.logits_output.full_logits, states
+                )
+                result.accept_lens = done.to(torch.int32) * algorithm.block_size
+            else:
+                # Capture output lengths before denoising changes the mask.
+                result.accept_lens = (blocks == algorithm.mask_id).sum(
+                    dim=1, dtype=torch.int32
+                )
+                if any(result.accept_lens.tolist()):
+                    final_out = algorithm.denoise_sync(runner, forward_batch, out)
+                    result.logits_output = final_out.logits_output
+                    result.can_run_cuda_graph = final_out.can_run_graph
+            result.next_token_ids = blocks
+            return result
+
+        # The shared event loop calls this after processing the previous result,
+        # then uses its existing copy stream and copy_done lifetime boundary.
+        result.delay_sample_func = finish
+        return result
+
+    def _dllm_pending_reqs(self: Scheduler):
+        # Reuse the common overlap queue as the source of ownership: no request
+        # may be prepared, stashed, or freed while its result is still pending.
+        return (
+            {
+                req
+                for batch, _ in getattr(self, "result_queue", ())
+                for req in batch.reqs
+            }
+            if self.enable_overlap
+            else set()
+        )
+
     def init_diffusion_llm(self: Scheduler):
         self.dllm_config = (
             DllmConfig.from_server_args(self.server_args)
@@ -46,7 +110,7 @@ class SchedulerDllmMixin:
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
         # Initialize DLLM manager and transfer requests
-        self.dllm_manager.init_next_round()
+        self.dllm_manager.init_next_round(self._dllm_pending_reqs())
         self._fetch_waiting_reqs()
 
         # Process batches
@@ -75,6 +139,20 @@ class SchedulerDllmMixin:
             result.copy_done.synchronize()
 
         fdfo_mode = self.dllm_config.first_done_first_out_mode
+        if self.enable_overlap:
+            result.next_token_ids = result.next_token_ids.tolist()
+            accepted = result.accept_lens.tolist()
+            result.accept_length_per_req_cpu = accepted
+            if not fdfo_mode:
+                result.next_token_ids = (
+                    [
+                        ids[-n:] if n else []
+                        for ids, n in zip(result.next_token_ids, accepted)
+                    ]
+                    if any(accepted)
+                    else []
+                )
+
         assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
             "FDFO dLLM result is missing accept lengths."
         )
@@ -89,7 +167,7 @@ class SchedulerDllmMixin:
                 req = batch.reqs[idx]
 
                 if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
+                    next_token_ids = result.next_token_ids[idx]
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
                         continue
@@ -212,7 +290,7 @@ class SchedulerDllmMixin:
         forward_mode = ForwardMode.DLLM_EXTEND
 
         # Try prefill batch first
-        prefill_reqs = self.dllm_manager.get_prefill_requests()
+        prefill_reqs = self.dllm_manager.get_prefill_requests(self._dllm_pending_reqs())
         if prefill_reqs:
             self._process_batch_by_phase(
                 adder,
@@ -223,7 +301,9 @@ class SchedulerDllmMixin:
             )
         else:
             # Fall back to decode batch
-            decode_reqs = self.dllm_manager.get_decode_requests()
+            decode_reqs = self.dllm_manager.get_decode_requests(
+                self._dllm_pending_reqs()
+            )
             self._process_batch_by_phase(
                 adder,
                 decode_reqs,
@@ -243,6 +323,10 @@ class SchedulerDllmMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         """Process a batch, separating staging and incoming requests."""
+        if self.enable_overlap:
+            # Leave capacity for another independent batch. Requests in the
+            # preceding batch become eligible only after result processing.
+            batch = batch[: max(1, (self.dllm_config.max_running_requests + 1) // 2)]
         staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
@@ -266,7 +350,7 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_inflight_middle_chunks()
+            self.dllm_manager.increment_inflight_middle_chunks(can_run_list)
 
     def _create_dllm_batch(
         self: Scheduler,
@@ -366,13 +450,21 @@ class DllmManager:
         self.waiting_queue: List[Req] = []
         self.staging_queue: List[Req] = []
 
-    def get_prefill_requests(self) -> List[Req]:
+    def get_prefill_requests(self, pending=()) -> List[Req]:
         """Get all prefill requests from waiting queue."""
-        return [req for req in self.waiting_queue if req.is_dllm_prefill()]
+        return [
+            req
+            for req in self.waiting_queue
+            if req not in pending and req.is_dllm_prefill()
+        ]
 
-    def get_decode_requests(self) -> List[Req]:
+    def get_decode_requests(self, pending=()) -> List[Req]:
         """Get all decode requests from waiting queue."""
-        return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
+        return [
+            req
+            for req in self.waiting_queue
+            if req not in pending and not req.is_dllm_prefill()
+        ]
 
     def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
         """Add requests to waiting queue with redundancy check."""
@@ -406,9 +498,9 @@ class DllmManager:
             return True
         return len(self.waiting_queue) == 0
 
-    def increment_inflight_middle_chunks(self) -> None:
+    def increment_inflight_middle_chunks(self, reqs=None) -> None:
         """Increment chunked count for all staging requests."""
-        for req in self.staging_queue:
+        for req in self.staging_queue if reqs is None else reqs:
             req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
@@ -435,8 +527,9 @@ class DllmManager:
 
         return aborted_reqs
 
-    def init_next_round(self) -> None:
+    def init_next_round(self, pending=()) -> None:
         """Initialize staging requests for next round and clear staging queue."""
         for req in self.staging_queue:
-            req.init_next_round_input()
-        self.staging_queue = []
+            if req not in pending:
+                req.init_next_round_input()
+        self.staging_queue = [req for req in self.staging_queue if req in pending]

@@ -638,6 +638,8 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Experimental dLLM support in the shared overlap scheduler.
+    SGLANG_ENABLE_DLLM_OVERLAP = EnvBool(False)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.

@@ -1,32 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional
 
 import torch
 
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
-DllmRunOutput = Tuple[
-    Union[LogitsProcessorOutput, torch.Tensor],
-    List,
-    Optional[List[int]],
-    Optional[List[Any]],
-    bool,
-]
-
 
 class DllmAlgorithm:
-    """dLLM algorithm: subclasses implement ``step``; the base owns the
-    synchronous and FDFO (``--dllm-fdfo``) execution loops in ``run``.
-    """
+    """Denoise algorithms and per-request state, independent of scheduling."""
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
@@ -49,10 +39,11 @@ class DllmAlgorithm:
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
-        """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+    ) -> torch.Tensor:
+        """Advance tokens/state and return a bool tensor, one value per block.
+
+        A completed block must already have its final KV persisted by this
+        forward; filling the last mask alone does not permit departure.
         """
         raise NotImplementedError
 
@@ -61,79 +52,77 @@ class DllmAlgorithm:
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]] = None,
-    ) -> DllmRunOutput:
+    ) -> GenerationBatchResult:
         if self.fdfo:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
-        batch_size = forward_batch.batch_size
-        input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
+        input_ids = forward_batch.input_ids.view(-1, self.block_size)
         return (input_ids != self.mask_id).sum(dim=1).tolist()
 
-    def _run_sync(
-        self, model_runner: ModelRunner, forward_batch: ForwardBatch
-    ) -> DllmRunOutput:
-        batch_size = forward_batch.batch_size
-        start_list = self._block_start_list(forward_batch)
-
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        # No mask to denoise: return empty so process_batch_result_dllm skips the
-        # stream branch (matches the pre-refactor behavior).
-        if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
-
+    def denoise_sync(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        out: ModelRunnerOutput,
+    ) -> ModelRunnerOutput:
+        """Finish a block from the logits of its already executed first forward."""
         states = self.init_step_state(forward_batch)
-        # NPU: attention metadata is stable across a block's denoise steps (the
-        # first forward above already planned it), so mark it ready once and let
-        # every later forward skip re-planning.
         if _is_npu:
             forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
-            done = self.step(forward_batch, out.logits_output.full_logits, states)
+            done = self.step(
+                forward_batch, out.logits_output.full_logits, states
+            ).tolist()
             if all(done):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        return out
 
-        next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+    def _run_sync(
+        self, model_runner: ModelRunner, forward_batch: ForwardBatch
+    ) -> GenerationBatchResult:
+        start_list = self._block_start_list(forward_batch)
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        tokens = []
+        if any(start < self.block_size for start in start_list):
+            out = self.denoise_sync(model_runner, forward_batch, out)
+            blocks = forward_batch.input_ids.view(-1, self.block_size).tolist()
+            tokens = [ids[start:] for ids, start in zip(blocks, start_list)]
+        return GenerationBatchResult(
+            logits_output=out.logits_output,
+            next_token_ids=tokens,
+            can_run_cuda_graph=out.can_run_graph,
+        )
+
+    def init_fdfo_states(self, forward_batch, algo_states):
+        if algo_states is None:
+            return self.init_step_state(forward_batch)
+        fresh = None
+        states = []
+        for carried in algo_states:
+            if carried is None:
+                if fresh is None:
+                    fresh = self.init_step_state(forward_batch)
+                states.append(fresh[len(states)])
+            else:
+                states.append(carried)
+        return states
 
     def _run_fdfo(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]],
-    ) -> DllmRunOutput:
-        batch_size = forward_batch.batch_size
-
-        if algo_states is None:
-            algo_states = [None] * batch_size
-        fresh: Optional[List[Any]] = None
-        states: List[Any] = []
-        for i, carried in enumerate(algo_states):
-            if carried is None:
-                if fresh is None:
-                    fresh = self.init_step_state(forward_batch)
-                states.append(fresh[i])
-            else:
-                states.append(carried)
-
+    ) -> GenerationBatchResult:
+        states = self.init_fdfo_states(forward_batch, algo_states)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        done = self.step(forward_batch, out.logits_output.full_logits, states)
-
-        accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
-        next_token_ids_list = forward_batch.input_ids.view(
-            batch_size, self.block_size
-        ).tolist()
-        states_out = [None if done[i] else states[i] for i in range(batch_size)]
-
-        return (
-            out.logits_output,
-            next_token_ids_list,
-            accept_length_per_req_cpu,
-            states_out,
-            out.can_run_graph,
+        done = self.step(forward_batch, out.logits_output.full_logits, states).tolist()
+        return GenerationBatchResult(
+            logits_output=out.logits_output,
+            next_token_ids=forward_batch.input_ids.view(-1, self.block_size).tolist(),
+            accept_length_per_req_cpu=[self.block_size if d else 0 for d in done],
+            dllm_algo_state=[None if d else state for d, state in zip(done, states)],
+            can_run_cuda_graph=out.can_run_graph,
         )

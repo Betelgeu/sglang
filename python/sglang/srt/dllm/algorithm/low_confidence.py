@@ -21,7 +21,7 @@ class LowConfidence(DllmAlgorithm):
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         batch_size = forward_batch.batch_size
         vocab_size = full_logits.shape[-1]
         logits = full_logits.view(batch_size, self.block_size, vocab_size)
@@ -49,7 +49,7 @@ class LowConfidence(DllmAlgorithm):
         # In-place to preserve the input_ids tensor identity (CUDA graph safe).
         forward_batch.input_ids.copy_(new_input_ids.view(-1))
 
-        return done.tolist()
+        return done
 
 
 Algorithm = LowConfidence

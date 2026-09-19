@@ -602,6 +602,13 @@ class TpModelWorker(BaseTpWorker):
     def is_dllm(self):
         return self.dllm_algorithm is not None
 
+    def prepare_dllm_batch(self, batch: ScheduleBatch) -> ForwardBatch:
+        """Prepare worker inputs for scheduler-controlled dLLM execution."""
+        self.set_hicache_consumer(batch.hicache_consumer_index)
+        return ForwardBatch.init_new(
+            batch, self.model_runner, return_hidden_states_before_norm=False
+        )
+
     def _forward_batch_generation_dllm(
         self,
         forward_batch: ForwardBatch,
@@ -611,21 +618,7 @@ class TpModelWorker(BaseTpWorker):
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
-        (
-            logits_output,
-            next_token_ids,
-            accept_length_per_req_cpu,
-            dllm_algo_state,
-            can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
-
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            dllm_algo_state=dllm_algo_state,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
+        return self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
 
     def forward_batch_generation(
         self,
