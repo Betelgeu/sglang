@@ -24,6 +24,7 @@ import time
 from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from copy import copy
 from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
@@ -1972,9 +1973,22 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            # A completed dLLM block seals its already-launched next step.
+            # Consume it in order, including counters/health checks, before reuse.
+            if self.dllm_config is not None and self.result_queue:
+                next_batch, next_result = self.result_queue[0]
+                if (
+                    next_result.dllm_block_ids is not None
+                    and next_result.dllm_next_batch is None
+                ):
+                    self.result_queue.popleft()
+                    self.process_batch_result(next_batch, next_result)
 
         while True:
             if self.gracefully_exit:
+                if self.dllm_config is not None:
+                    while self.result_queue:
+                        pop_and_process()
                 break
 
             # Receive requests
@@ -2030,8 +2044,12 @@ class Scheduler(
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # Update last_batch
-            self.last_batch = batch
+            # A dLLM block boundary may have drained the speculative next step.
+            self.last_batch = (
+                None
+                if self.dllm_config is not None and not self.result_queue
+                else batch
+            )
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -2056,6 +2074,7 @@ class Scheduler(
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
             and batch_is_extend
             and last_batch_is_extend
+            and not batch.is_dllm()
         )
 
         # Sync so the FSM advance lands before the next batch's bitmask. Permanent
@@ -2100,6 +2119,8 @@ class Scheduler(
         recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
         if recv_reqs:
             self.metrics_reporter.record_scheduler_active()
+            if self.dllm_config is not None and self.enable_overlap:
+                self.drain_dllm_before_control(recv_reqs)
         self.process_input_requests(recv_reqs)
         return recv_reqs
 
@@ -3632,6 +3653,13 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        if self.dllm_config is not None and self.enable_overlap and self.result_queue:
+            # Continue the same block before ordinary scheduling can stash,
+            # free, or rebuild its still-in-flight request/KV slots.
+            return NextBatchPlan(
+                batch_to_run=self.get_new_batch_dllm(running_batch),
+                running_batch=running_batch,
+            )
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -3646,7 +3674,7 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                if self.dllm_config.first_done_first_out_mode:
+                if self.dllm_config.first_done_first_out_mode or self.enable_overlap:
                     if not req.dllm_incomplete_ids:
                         self.stash_chunked_request(req)
                         self.req_to_token_pool.free(req)
@@ -4358,7 +4386,8 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                if not batch.is_dllm():
+                    self.future_map.resolve_seq_lens_cpu(batch)
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
@@ -4368,7 +4397,8 @@ class Scheduler(
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                    if not (batch.is_dllm() and batch.dllm_step_id):
+                        resolve_forward_inputs(batch, self.future_map)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -4391,10 +4421,13 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
-                        if batch.spec_algorithm.is_none():
+                        if batch.is_dllm():
+                            batch_result = self.run_batch_dllm_overlap(batch)
+                        else:
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
+                        if batch.spec_algorithm.is_none() and not batch.is_dllm():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -4420,9 +4453,10 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self._relay_forward_payload(
-                                batch, future_indices, batch_result
-                            )
+                            if not batch.is_dllm():
+                                self._relay_forward_payload(
+                                    batch, future_indices, batch_result
+                                )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
@@ -4443,8 +4477,20 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # Next-iter input_ids relayed via future_map.
-                batch.input_ids = None
+                if batch_result.dllm_block_ids is not None:
+                    # Snapshot AFTER isolation restores scheduler sampling_info.
+                    # Keep complete inputs for same-block continuation.
+                    batch_result.dllm_next_batch = copy(batch)
+                    batch_result.dllm_next_batch.reqs = batch.reqs[:]
+                    batch_result.dllm_next_batch.dllm_algo_state = (
+                        batch_result.dllm_algo_state
+                    )
+                    if batch.dllm_steps_left is not None:
+                        batch_result.dllm_next_batch.dllm_steps_left -= 1
+                    batch_result.dllm_next_batch.dllm_step_id = batch.forward_iter
+
+                if not batch.is_dllm():
+                    batch.input_ids = None
 
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
@@ -4710,9 +4756,10 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
-            self._relay_forward_payload(
-                cur_batch, batch_result.future_indices, batch_result
-            )
+            if not cur_batch.is_dllm():
+                self._relay_forward_payload(
+                    cur_batch, batch_result.future_indices, batch_result
+                )
 
         # Run device-to-host copy on a separate stream to avoid blocking the
         # forward stream. The copy waits for the sampled result and can overlap

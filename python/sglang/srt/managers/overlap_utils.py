@@ -320,6 +320,39 @@ class FutureMap:
             pool=req_to_token_pool,
         )
 
+    def publish_dllm(self, slots, tokens, done, block_ids, step_id):
+        """Publish a whole block on forward_stream, independently of D2H."""
+        if not hasattr(self, "dllm_tokens"):
+            self.dllm_tokens = torch.empty(
+                (self.req_pool_size, tokens.shape[1]),
+                dtype=tokens.dtype,
+                device=self.device,
+            )
+            self.dllm_done = torch.empty(
+                self.req_pool_size, dtype=torch.bool, device=self.device
+            )
+            self.dllm_block_ids = torch.empty(
+                self.req_pool_size, dtype=torch.int64, device=self.device
+            )
+            self.dllm_step_ids = torch.empty_like(self.dllm_block_ids)
+        self.dllm_tokens[slots] = tokens
+        self.dllm_done[slots] = done
+        self.dllm_block_ids[slots] = block_ids
+        # index_put with a Python scalar copies a CPU tensor to CUDA and waits.
+        self.dllm_step_ids.index_fill_(0, slots, step_id)
+
+    def resolve_dllm(self, slots, block_ids, step_id):
+        # Async device assertion: never round-trip tokens/completion through CPU.
+        torch._assert_async(
+            torch.all(
+                (self.dllm_block_ids[slots] == block_ids)
+                & (self.dllm_step_ids[slots] == step_id)
+            ),
+            "stale dLLM block/step relay",
+        )
+        # Advanced indexing allocates private forward inputs, not buffer views.
+        return self.dllm_tokens[slots], self.dllm_done[slots]
+
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
         from sglang.srt.speculative.spec_utils import spec_need_hidden_states

@@ -24,6 +24,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -58,6 +59,9 @@ class GenerationBatchResult:
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
+    # Full immutable-within-block metadata; ScheduleBatch.copy() is result-only.
+    dllm_next_batch: Optional[ScheduleBatch] = None
+    dllm_block_ids: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

@@ -1733,6 +1733,29 @@ def _dllm_overlap_disable(view: Any) -> dict:
         return {}
     if view.disable_overlap_schedule:
         return {}
+    if envs.SGLANG_ENABLE_DLLM_OVERLAP.get():
+        if not view.dllm_fdfo and envs.SGLANG_DISABLE_LAZY_COMPACTION.get():
+            raise ValueError(
+                "dLLM sync overlap does not support eager compaction: "
+                "delayed denoising may still use old KV addresses"
+            )
+        if view.dllm_algorithm not in ("LowConfidence", "JointThreshold"):
+            raise ValueError(
+                "Experimental dLLM overlap supports LowConfidence and JointThreshold"
+            )
+        if (
+            view.device != "cuda"
+            or view.tp_size != 1
+            or view.pp_size != 1
+            or view.dp_size != 1
+            or view.speculative_algorithm is not None
+            or view.disaggregation_mode != "null"
+        ):
+            raise ValueError(
+                "Experimental dLLM overlap requires CUDA TP1/PP1/DP1 "
+                "without speculative decoding or disaggregation"
+            )
+        return {}
     logger.warning(
         "Overlap schedule is disabled because of using diffusion LLM inference"
     )

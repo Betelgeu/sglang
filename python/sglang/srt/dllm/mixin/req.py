@@ -23,6 +23,7 @@ class ReqDllmMixin:
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_block_offset = 0
+        self.dllm_committed_block_id = -1
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:

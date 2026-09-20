@@ -125,9 +125,6 @@ class JointThreshold(DllmAlgorithm):
         self.vectorized_decoding = config.algorithm_config.get(
             "vectorized_decoding", _is_npu
         )
-        # The sync loop advances one shared batched state in place across steps;
-        # FDFO must carry state per request, so it gathers/scatters each round.
-        self._use_shared_state = self.vectorized_decoding and not self.fdfo
 
     def max_steps(self, block_size: int) -> int:
         return block_size + self.max_post_edit_steps + 1
@@ -138,24 +135,24 @@ class JointThreshold(DllmAlgorithm):
         # Built once as a GPU tensor and reused across steps (no per-step
         # host/device transfer); the FDFO carry keeps it in-process.
         prompt_mask = input_ids != self.mask_id
-        if self._use_shared_state:
-            # One shared batched state, advanced in place across every step of the
-            # synchronous loop.
-            device = forward_batch.input_ids.device
-            shared = {
-                "prompt_masks": prompt_mask,  # [B, blk]
-                "finished": torch.zeros(batch_size, dtype=torch.bool, device=device),
-                "post_edit_steps": torch.zeros(
-                    batch_size, dtype=torch.int32, device=device
-                ),
-            }
-            return [shared] * batch_size
+        if self.vectorized_decoding:
+            # Per-request GPU scalars survive batch regrouping without D2H.
+            finished = torch.zeros(
+                batch_size, dtype=torch.bool, device=input_ids.device
+            )
+            post_edit_steps = torch.zeros(
+                batch_size, dtype=torch.int32, device=input_ids.device
+            )
+            return [
+                {
+                    "post_edit_steps": post_edit_steps[i],
+                    "finished": finished[i],
+                    "prompt_mask": prompt_mask[i],
+                }
+                for i in range(batch_size)
+            ]
         return [
-            {
-                "post_edit_steps": 0,
-                "finished": False,
-                "prompt_mask": prompt_mask[i],
-            }
+            {"post_edit_steps": 0, "finished": False, "prompt_mask": prompt_mask[i]}
             for i in range(batch_size)
         ]
 
@@ -164,61 +161,25 @@ class JointThreshold(DllmAlgorithm):
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
-        if self._use_shared_state:
-            return self._step_vectorized_shared(
-                forward_batch=forward_batch, full_logits=full_logits, states=states
-            )
+    ) -> torch.Tensor:
         if self.vectorized_decoding:
-            return self._step_vectorized_fdfo(
+            return self._step_vectorized(
                 forward_batch=forward_batch, full_logits=full_logits, states=states
             )
         return self._step_per_row(
             forward_batch=forward_batch, full_logits=full_logits, states=states
         )
 
-    def _step_vectorized_shared(
+    def _step_vectorized(
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
-        shared = states[0]
-        joint_threshold_update_step_vectorized(
-            input_ids_1d=forward_batch.input_ids,
-            full_logits_2d=full_logits,
-            prompt_masks=shared["prompt_masks"],
-            finished=shared["finished"],
-            post_edit_steps=shared["post_edit_steps"],
-            mask_id=self.mask_id,
-            blk=self.block_size,
-            threshold=self.threshold,
-            edit_threshold=self.edit_threshold,
-            max_post_edit_steps=self.max_post_edit_steps,
-            penalty_lambda=self.penalty_lambda,
-        )
-        return shared["finished"].tolist()
-
-    def _step_vectorized_fdfo(
-        self,
-        forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        # FDFO carries per-request dict states across rounds (stashed on the
-        # request, re-mixed with fresh rows each round), so gather them into
-        # batched tensors for this round's single step, then scatter the results
-        # back onto the per-request dicts.
-        device = forward_batch.input_ids.device
+    ) -> torch.Tensor:
+        # Gather/scatter GPU state in either mode; no per-step CPU conversion.
         prompt_masks = torch.stack([state["prompt_mask"] for state in states])
-        finished = torch.tensor(
-            [state["finished"] for state in states], dtype=torch.bool, device=device
-        )
-        post_edit_steps = torch.tensor(
-            [state["post_edit_steps"] for state in states],
-            dtype=torch.int32,
-            device=device,
-        )
+        finished = torch.stack([state["finished"] for state in states])
+        post_edit_steps = torch.stack([state["post_edit_steps"] for state in states])
 
         joint_threshold_update_step_vectorized(
             input_ids_1d=forward_batch.input_ids,
@@ -234,19 +195,17 @@ class JointThreshold(DllmAlgorithm):
             penalty_lambda=self.penalty_lambda,
         )
 
-        done = finished.tolist()
-        new_post_edit_steps = post_edit_steps.tolist()
         for i, state in enumerate(states):
-            state["finished"] = done[i]
-            state["post_edit_steps"] = new_post_edit_steps[i]
-        return done
+            state["finished"] = finished[i]
+            state["post_edit_steps"] = post_edit_steps[i]
+        return finished
 
     def _step_per_row(
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
         states: List[Any],
-    ) -> List[bool]:
+    ) -> torch.Tensor:
         batch_size = forward_batch.batch_size
         done: List[bool] = []
 
@@ -312,7 +271,9 @@ class JointThreshold(DllmAlgorithm):
             # block's final KV: emit it now rather than after an extra forward.
             done.append(state["finished"])
 
-        return done
+        return torch.tensor(
+            done, dtype=torch.bool, device=forward_batch.input_ids.device
+        )
 
 
 Algorithm = JointThreshold

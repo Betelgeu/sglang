@@ -4,22 +4,137 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
 
 
 class SchedulerDllmMixin:
+    def run_batch_dllm_overlap(self: Scheduler, batch: ScheduleBatch):
+        """Launch first forward; resume denoising after the previous result commits.
+
+        Called inside run_batch's existing forward stream/isolation context.
+        Sync and FDFO reuse block metadata and read the preceding GPU step.
+        """
+        worker = self.tp_worker
+        algorithm = worker.dllm_algorithm
+        block_ids = [req.extend_range.end for req in batch.reqs]
+        if not batch.dllm_step_id:
+            batch.dllm_block_ids = torch.tensor(
+                block_ids, dtype=torch.int64, device=batch.req_pool_indices.device
+            )
+            batch.input_ids = batch.input_ids.clone()
+            if not algorithm.fdfo:
+                batch.dllm_steps_left = algorithm.max_steps(algorithm.block_size)
+        versions = batch.dllm_block_ids
+        previous_done = None
+        if batch.dllm_step_id:
+            tokens, previous_done = self.future_map.resolve_dllm(
+                batch.req_pool_indices, versions, batch.dllm_step_id
+            )
+            batch.input_ids = tokens.flatten()
+        runner = worker.model_runner
+        worker.set_hicache_consumer(batch.hicache_consumer_index)
+        forward_batch = ForwardBatch.init_new(
+            batch, runner, return_hidden_states_before_norm=False
+        )
+        # CPU has not committed the preceding result yet. Its block-owned
+        # algorithm state, especially prompt masks/edit budgets, is authoritative.
+        states = (
+            batch.dllm_algo_state
+            if batch.dllm_step_id
+            else algorithm.init_fdfo_states(
+                forward_batch, [req.dllm_algo_state for req in batch.reqs]
+            )
+        )
+        out = runner.forward(forward_batch, pp_proxy_tensors=None)
+        result = GenerationBatchResult(
+            logits_output=out.logits_output,
+            dllm_algo_state=states,
+            can_run_cuda_graph=out.can_run_graph,
+            dllm_block_ids=block_ids,
+        )
+
+        # Request phase may still describe the preceding block. Only a block
+        # entirely inside the original prompt, without an actual mask token,
+        # needs only the KV-persisting forward.
+        pure_prefill = all(
+            end <= len(req.origin_input_ids)
+            and algorithm.mask_id
+            not in req.origin_input_ids[end - algorithm.block_size : end]
+            for req, end in zip(batch.reqs, block_ids)
+        )
+
+        def finish():
+            blocks = forward_batch.input_ids.view(-1, algorithm.block_size)
+            if pure_prefill or (
+                batch.dllm_steps_left is not None and batch.dllm_steps_left <= 0
+            ):
+                # As in _run_sync, persist the final update after max_steps.
+                done = torch.ones(
+                    len(batch.reqs), dtype=torch.bool, device=blocks.device
+                )
+            else:
+                done = algorithm.step(
+                    forward_batch, out.logits_output.full_logits, states
+                )
+            if previous_done is not None:
+                done = done | previous_done
+            self.future_map.publish_dllm(
+                batch.req_pool_indices, blocks, done, versions, batch.forward_iter
+            )
+            # Sync keeps all rows in the block until the entire batch completes.
+            accepted = done if algorithm.fdfo else done.all().expand_as(done)
+            result.accept_lens = accepted.to(torch.int32) * algorithm.block_size
+            # Neither a later step nor graph input reuse may overwrite D2H data.
+            result.next_token_ids = blocks.clone()
+            return result
+
+        # The shared event loop calls this after processing the previous result,
+        # then uses its existing copy stream and copy_done lifetime boundary.
+        result.delay_sample_func = finish
+        return result
+
+    def drain_dllm_before_control(self: Scheduler, recv_reqs):
+        """Ordinary arrivals enqueue; controls wait before changing ownership."""
+        if all(
+            isinstance(req, (TokenizedGenerateReqInput, BatchTokenizedGenerateReqInput))
+            for req in recv_reqs
+        ):
+            return
+        while self.result_queue:
+            batch, result = self.result_queue.popleft()
+            self.process_batch_result(batch, result)
+            if (
+                not self.dllm_config.first_done_first_out_mode
+                and not self.result_queue
+                and result.dllm_next_batch is not None
+                and not any(result.accept_length_per_req_cpu)
+            ):
+                # Preserve sync's current block budget/state while draining.
+                batch = result.dllm_next_batch
+                result = self.run_batch(batch)
+                self._apply_war_barrier()
+                self.result_queue.append((batch.copy(), result))
+                self.launch_batch_sample_if_needed(result, batch)
+        self.last_batch = None
+
     def init_diffusion_llm(self: Scheduler):
         self.dllm_config = (
             DllmConfig.from_server_args(self.server_args)
@@ -32,6 +147,22 @@ class SchedulerDllmMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
+        if self.enable_overlap and self.result_queue:
+            continuation = self.result_queue[-1][1].dllm_next_batch
+            if continuation is not None:
+                if all(
+                    req.extend_range.end <= len(req.origin_input_ids)
+                    and self.dllm_config.mask_id
+                    not in req.origin_input_ids[
+                        req.extend_range.end
+                        - self.dllm_config.block_size : req.extend_range.end
+                    ]
+                    for req in continuation.reqs
+                ):
+                    # No denoising to relay. Let the common loop commit this
+                    # prompt forward; keep next_batch intact (None means sealed).
+                    return None
+            return continuation
         if self.enable_priority_preemption:
             running_batch.batch_is_full = False
 
@@ -74,22 +205,51 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
-            "FDFO dLLM result is missing accept lengths."
+        block_results = (
+            self.dllm_config.first_done_first_out_mode or self.enable_overlap
+        )
+        if self.enable_overlap:
+            result.next_token_ids = result.next_token_ids.tolist()
+            accepted = result.accept_lens.tolist()
+            result.accept_length_per_req_cpu = accepted
+
+        assert not block_results or result.accept_length_per_req_cpu is not None, (
+            "Block dLLM result is missing accept lengths."
         )
 
-        # FDFO also commits unresolved blocks so their KV can be reused.
-        if fdfo_mode or result.next_token_ids:
+        live_indices = list(range(batch.batch_size()))
+        block_ids = getattr(result, "dllm_block_ids", None)
+        if block_ids is not None:
+            live_indices = [
+                i
+                for i in live_indices
+                if block_ids[i] > batch.reqs[i].dllm_committed_block_id
+            ]
+            if not live_indices:
+                return  # A redundant step of an already committed block.
+            if any(result.accept_length_per_req_cpu[i] for i in live_indices):
+                # Next step may already be writing the SAME KV slots. Finish
+                # its delayed step and D2H before this result can free anything.
+                # No new block is prepared until both results have been consumed.
+                if self.result_queue:
+                    next_batch, next_result = self.result_queue[0]
+                    self.launch_batch_sample_if_needed(next_result, next_batch)
+                    next_result.copy_done.synchronize()
+                    # Stop same-block continuation. The common loop consumes
+                    # this extra result after finishing the current result.
+                    next_result.dllm_next_batch = None
+
+        # Whole-block results also carry unresolved tokens for the next step.
+        if block_results or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
 
             self.token_to_kv_pool_allocator.free_group_begin()
-            for idx in range(batch.batch_size()):
+            for idx in live_indices:
                 req = batch.reqs[idx]
 
-                if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
+                if not block_results:
+                    next_token_ids = result.next_token_ids[idx]
                     new_tokens = len(next_token_ids)
                     if new_tokens == 0:
                         continue
@@ -120,6 +280,8 @@ class SchedulerDllmMixin:
 
                 req.dllm_incomplete_ids = array("q")
                 req.dllm_algo_state = None
+                if block_ids is not None:
+                    req.dllm_committed_block_id = block_ids[idx]
 
                 # Mirror the resolved block into the committed fill ids so the
                 # prefix cache keys on the real tokens, not the mask block, next
@@ -147,7 +309,9 @@ class SchedulerDllmMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            self.output_streamer.stream_output(
+                [batch.reqs[i] for i in live_indices], batch.return_logprob
+            )
             self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.report_prefill_stats(

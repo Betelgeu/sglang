@@ -2464,6 +2464,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # 0 starts from CPU inputs; otherwise the preceding global forward_iter to consume.
+    dllm_step_id: int = 0
+    # Block-owned GPU state is relayed before the preceding CPU result commits.
+    dllm_algo_state: Optional[List[Any]] = None
+    # Sync's remaining denoise budget; zero still requires a final KV forward.
+    dllm_steps_left: Optional[int] = None
+    dllm_block_ids: Optional[torch.Tensor] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -3753,6 +3760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            dllm_config=self.dllm_config,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
