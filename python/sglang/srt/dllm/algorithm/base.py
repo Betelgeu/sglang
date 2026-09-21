@@ -1,26 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.dllm.algorithm import get_algorithm
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
 
-_is_npu = is_npu()
+if TYPE_CHECKING:
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.server_args import ServerArgs
 
-DllmRunOutput = Tuple[
-    Union[LogitsProcessorOutput, torch.Tensor],
-    List,
-    Optional[List[int]],
-    Optional[List[Any]],
-    bool,
-]
+_is_npu = is_npu()
 
 
 class DllmAlgorithm:
@@ -38,8 +31,8 @@ class DllmAlgorithm:
         config = DllmConfig.from_server_args(server_args)
         return get_algorithm(config)
 
-    def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
-        return [None] * forward_batch.batch_size
+    def init_step_state(self, forward_batch: ForwardBatch) -> dict[str, torch.Tensor]:
+        return {}
 
     def max_steps(self, block_size: int) -> int:
         return block_size + 1
@@ -48,11 +41,12 @@ class DllmAlgorithm:
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        """One denoise step, advancing ``forward_batch.input_ids``/``states`` in
-        place. Returns, per block, whether it was already complete *on entry* --
-        i.e. this forward persisted its final KV cache and it can be emitted.
+        states: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Advance tokens/state in place and return device bool ``[B]`` done.
+
+        Done means this forward persisted the final tokens' KV, not merely that
+        all masks were filled. Terminal rows must preserve their tokens/state.
         """
         raise NotImplementedError
 
@@ -60,80 +54,62 @@ class DllmAlgorithm:
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-        algo_states: Optional[List[Any]] = None,
-    ) -> DllmRunOutput:
+        algo_states: Optional[dict[str, torch.Tensor]] = None,
+    ) -> GenerationBatchResult:
         if self.fdfo:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
 
-    def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
-        batch_size = forward_batch.batch_size
-        input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        return (input_ids != self.mask_id).sum(dim=1).tolist()
-
     def _run_sync(
         self, model_runner: ModelRunner, forward_batch: ForwardBatch
-    ) -> DllmRunOutput:
-        batch_size = forward_batch.batch_size
-        start_list = self._block_start_list(forward_batch)
-
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        # No mask to denoise: return empty so process_batch_result_dllm skips the
-        # stream branch (matches the pre-refactor behavior).
-        if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
-
+    ) -> GenerationBatchResult:
+        # Each synchronous call starts a new block. No-mask prompt rows are
+        # already terminal; step leaves them unchanged while other rows denoise.
         states = self.init_step_state(forward_batch)
-        # NPU: attention metadata is stable across a block's denoise steps (the
-        # first forward above already planned it), so mark it ready once and let
-        # every later forward skip re-planning.
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        # NPU attention metadata is stable across the block's denoise steps.
         if _is_npu:
             forward_batch.mark_forward_metadata_ready()
         for _ in range(self.max_steps(self.block_size)):
             done = self.step(forward_batch, out.logits_output.full_logits, states)
-            if all(done):
+            # Sync mode intentionally retains its CPU completion decision.
+            if all(done.cpu().tolist()):
                 break
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
-        next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        next_token_ids_list = [
-            next_token_ids[i, start_list[i] :] for i in range(batch_size)
-        ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return self._make_result(forward_batch, out, done, states)
 
     def _run_fdfo(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-        algo_states: Optional[List[Any]],
-    ) -> DllmRunOutput:
-        batch_size = forward_batch.batch_size
-
-        if algo_states is None:
-            algo_states = [None] * batch_size
-        fresh: Optional[List[Any]] = None
-        states: List[Any] = []
-        for i, carried in enumerate(algo_states):
-            if carried is None:
-                if fresh is None:
-                    fresh = self.init_step_state(forward_batch)
-                states.append(fresh[i])
-            else:
-                states.append(carried)
-
+        algo_states: Optional[dict[str, torch.Tensor]] = None,
+    ) -> GenerationBatchResult:
+        # The caller gathers mixed fresh/continuing rows into one batched dict.
+        states = (
+            self.init_step_state(forward_batch) if algo_states is None else algo_states
+        )
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
+        return self._make_result(forward_batch, out, done, states)
 
-        accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
-        next_token_ids_list = forward_batch.input_ids.view(
-            batch_size, self.block_size
-        ).tolist()
-        states_out = [None if done[i] else states[i] for i in range(batch_size)]
+    def _make_result(
+        self,
+        forward_batch: ForwardBatch,
+        out,
+        done: torch.Tensor,
+        states: dict[str, torch.Tensor],
+    ) -> GenerationBatchResult:
+        # Imported after algorithm discovery to avoid the managers/algorithm
+        # import cycle. Snapshots survive reuse of inputs and continuation state.
+        from sglang.srt.managers.utils import GenerationBatchResult
 
-        return (
-            out.logits_output,
-            next_token_ids_list,
-            accept_length_per_req_cpu,
-            states_out,
-            out.can_run_graph,
+        return GenerationBatchResult(
+            logits_output=out.logits_output,
+            next_token_ids=forward_batch.input_ids.view(
+                forward_batch.batch_size, self.block_size
+            ).clone(),
+            dllm_done=done.clone(),
+            dllm_algo_state={key: value.clone() for key, value in states.items()},
+            can_run_cuda_graph=out.can_run_graph,
         )

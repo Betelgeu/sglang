@@ -1,15 +1,8 @@
-from typing import Any, List
-
-import numpy as np
 import torch
 import torch.nn.functional as F
-
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 
 def joint_threshold_update_step_vectorized(
@@ -29,7 +22,7 @@ def joint_threshold_update_step_vectorized(
 
     Advances ``input_ids_1d`` / ``finished`` / ``post_edit_steps`` in place,
     processing every block at once (no per-row Python loop or ``.item()`` sync).
-    Semantics mirror the per-row path in ``JointThreshold.step``.
+    Finished rows preserve their tokens and state.
     """
     B = input_ids_1d.shape[0] // blk
     V = full_logits_2d.shape[1]
@@ -120,76 +113,38 @@ class JointThreshold(DllmAlgorithm):
             "max_post_edit_steps", 16
         )
         self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
-        # NPU defaults to the batched (vectorized) path; other platforms keep the
-        # upstream per-row path unless explicitly overridden via algorithm_config.
-        self.vectorized_decoding = config.algorithm_config.get(
-            "vectorized_decoding", _is_npu
-        )
-        # The sync loop advances one shared batched state in place across steps;
-        # FDFO must carry state per request, so it gathers/scatters each round.
-        self._use_shared_state = self.vectorized_decoding and not self.fdfo
+        # All platforms use the tensor path; legacy vectorized_decoding
+        # configuration no longer selects a host-synchronizing per-row path.
 
     def max_steps(self, block_size: int) -> int:
         return block_size + self.max_post_edit_steps + 1
 
-    def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
+    def init_step_state(self, forward_batch: ForwardBatch) -> dict[str, torch.Tensor]:
         batch_size = forward_batch.batch_size
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
-        # Built once as a GPU tensor and reused across steps (no per-step
-        # host/device transfer); the FDFO carry keeps it in-process.
-        prompt_mask = input_ids != self.mask_id
-        if self._use_shared_state:
-            # One shared batched state, advanced in place across every step of the
-            # synchronous loop.
-            device = forward_batch.input_ids.device
-            shared = {
-                "prompt_masks": prompt_mask,  # [B, blk]
-                "finished": torch.zeros(batch_size, dtype=torch.bool, device=device),
-                "post_edit_steps": torch.zeros(
-                    batch_size, dtype=torch.int32, device=device
-                ),
-            }
-            return [shared] * batch_size
-        return [
-            {
-                "post_edit_steps": 0,
-                "finished": False,
-                "prompt_mask": prompt_mask[i],
-            }
-            for i in range(batch_size)
-        ]
+        prompt_masks = input_ids != self.mask_id
+        return {
+            "prompt_masks": prompt_masks,
+            # Fully populated fresh rows are prompt-only blocks, not candidates
+            # for post-editing. Continuing rows retain their original masks.
+            "finished": prompt_masks.all(dim=1),
+            "post_edit_steps": torch.zeros(
+                batch_size, dtype=torch.int32, device=input_ids.device
+            ),
+        }
 
     def step(
         self,
         forward_batch: ForwardBatch,
         full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        if self._use_shared_state:
-            return self._step_vectorized_shared(
-                forward_batch=forward_batch, full_logits=full_logits, states=states
-            )
-        if self.vectorized_decoding:
-            return self._step_vectorized_fdfo(
-                forward_batch=forward_batch, full_logits=full_logits, states=states
-            )
-        return self._step_per_row(
-            forward_batch=forward_batch, full_logits=full_logits, states=states
-        )
-
-    def _step_vectorized_shared(
-        self,
-        forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        shared = states[0]
+        states: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
         joint_threshold_update_step_vectorized(
             input_ids_1d=forward_batch.input_ids,
             full_logits_2d=full_logits,
-            prompt_masks=shared["prompt_masks"],
-            finished=shared["finished"],
-            post_edit_steps=shared["post_edit_steps"],
+            prompt_masks=states["prompt_masks"],
+            finished=states["finished"],
+            post_edit_steps=states["post_edit_steps"],
             mask_id=self.mask_id,
             blk=self.block_size,
             threshold=self.threshold,
@@ -197,122 +152,9 @@ class JointThreshold(DllmAlgorithm):
             max_post_edit_steps=self.max_post_edit_steps,
             penalty_lambda=self.penalty_lambda,
         )
-        return shared["finished"].tolist()
-
-    def _step_vectorized_fdfo(
-        self,
-        forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        # FDFO carries per-request dict states across rounds (stashed on the
-        # request, re-mixed with fresh rows each round), so gather them into
-        # batched tensors for this round's single step, then scatter the results
-        # back onto the per-request dicts.
-        device = forward_batch.input_ids.device
-        prompt_masks = torch.stack([state["prompt_mask"] for state in states])
-        finished = torch.tensor(
-            [state["finished"] for state in states], dtype=torch.bool, device=device
-        )
-        post_edit_steps = torch.tensor(
-            [state["post_edit_steps"] for state in states],
-            dtype=torch.int32,
-            device=device,
-        )
-
-        joint_threshold_update_step_vectorized(
-            input_ids_1d=forward_batch.input_ids,
-            full_logits_2d=full_logits,
-            prompt_masks=prompt_masks,
-            finished=finished,
-            post_edit_steps=post_edit_steps,
-            mask_id=self.mask_id,
-            blk=self.block_size,
-            threshold=self.threshold,
-            edit_threshold=self.edit_threshold,
-            max_post_edit_steps=self.max_post_edit_steps,
-            penalty_lambda=self.penalty_lambda,
-        )
-
-        done = finished.tolist()
-        new_post_edit_steps = post_edit_steps.tolist()
-        for i, state in enumerate(states):
-            state["finished"] = done[i]
-            state["post_edit_steps"] = new_post_edit_steps[i]
-        return done
-
-    def _step_per_row(
-        self,
-        forward_batch: ForwardBatch,
-        full_logits: torch.Tensor,
-        states: List[Any],
-    ) -> List[bool]:
-        batch_size = forward_batch.batch_size
-        done: List[bool] = []
-
-        for i in range(batch_size):
-            state = states[i]
-            if state["finished"]:
-                done.append(True)
-                continue
-
-            block_start = i * self.block_size
-            block_end = block_start + self.block_size
-            curr_input_ids = forward_batch.input_ids[block_start:block_end]
-            curr_logits = full_logits[block_start:block_end]
-            curr_prompt_mask = state["prompt_mask"]
-
-            if self.penalty_lambda > 0:
-                prev_ids = curr_input_ids[:-1]
-                curr_logits[1:, :].scatter_(
-                    1, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
-                )
-
-            x = torch.argmax(curr_logits, dim=-1)
-            p = torch.squeeze(
-                torch.gather(
-                    F.softmax(curr_logits, dim=-1),
-                    dim=-1,
-                    index=torch.unsqueeze(x, -1),
-                ),
-                -1,
-            )
-
-            mask_index = curr_input_ids == self.mask_id
-            has_mask = mask_index.any()
-
-            # Mask to token (M2T)
-            mask_transfer_index = torch.zeros_like(mask_index)
-            budget_exhausted = False
-            if has_mask:
-                confidence = torch.where(mask_index, p, -np.inf)
-                mask_transfer_index = confidence > self.threshold
-                if not mask_transfer_index.any():
-                    _, select_index = torch.topk(confidence, k=1)
-                    mask_transfer_index[select_index] = True
-            else:
-                state["post_edit_steps"] += 1
-                if state["post_edit_steps"] > self.max_post_edit_steps:
-                    state["finished"] = True
-                    budget_exhausted = True
-
-            if not budget_exhausted:
-                # Token to token (T2T)
-                edit_mask = ~mask_index & ~curr_prompt_mask
-                edit_transfer_index = (
-                    (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
-                )
-                transfer_index = mask_transfer_index | edit_transfer_index
-                if transfer_index.any():
-                    curr_input_ids[transfer_index] = x[transfer_index]
-                else:
-                    state["finished"] = True
-
-            # A terminating step changes nothing, so this forward already holds the
-            # block's final KV: emit it now rather than after an extra forward.
-            done.append(state["finished"])
-
-        return done
+        # A terminating step changes no tokens, so its forward already wrote
+        # final KV. A later redundant step remains a terminal no-op.
+        return states["finished"]
 
 
 Algorithm = JointThreshold

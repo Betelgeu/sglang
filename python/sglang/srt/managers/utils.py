@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 import msgspec
 import torch
-
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -52,9 +51,9 @@ class GenerationBatchResult:
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
-    # FDFO dLLM batching: per-request accepted block length and carried algo state.
-    accept_length_per_req_cpu: Optional[List[int]] = None
-    dllm_algo_state: Optional[List[Any]] = None
+    # dLLM: device completion mask and algorithm state for block continuation.
+    dllm_algo_state: Optional[dict[str, torch.Tensor]] = None
+    dllm_done: Optional[torch.Tensor] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -161,6 +160,9 @@ class GenerationBatchResult:
                 self.logits_output.hidden_states
             )
         self.next_token_ids = _async_d2h(self.next_token_ids)
+
+        if self.dllm_done is not None:
+            self.dllm_done = _async_d2h(self.dllm_done)
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)

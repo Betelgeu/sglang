@@ -20,7 +20,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -572,23 +571,23 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         algo_states = None
         if self.dllm_algorithm.fdfo and batch is not None:
-            algo_states = [req.dllm_algo_state for req in batch.reqs]
-
-        (
-            logits_output,
-            next_token_ids,
-            accept_length_per_req_cpu,
-            dllm_algo_state,
-            can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
-
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            dllm_algo_state=dllm_algo_state,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
+            algo_states = batch.dllm_algo_state
+            if algo_states is None and any(r.dllm_algo_state for r in batch.reqs):
+                # The non-overlap/block-boundary path can mix fresh and retained
+                # rows. All values stay on device; no per-step host conversion.
+                fresh = self.dllm_algorithm.init_step_state(forward_batch)
+                algo_states = {
+                    name: torch.stack(
+                        [
+                            req.dllm_algo_state[name]
+                            if req.dllm_algo_state is not None
+                            else value[i]
+                            for i, req in enumerate(batch.reqs)
+                        ]
+                    )
+                    for name, value in fresh.items()
+                }
+        return self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
 
     def forward_batch_generation(
         self,
