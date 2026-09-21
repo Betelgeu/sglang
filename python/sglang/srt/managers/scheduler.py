@@ -2000,6 +2000,8 @@ class Scheduler(
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> bool:
+        if self.dllm_config is not None:
+            return False
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
@@ -2061,6 +2063,12 @@ class Scheduler(
         recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
         if recv_reqs:
             self.metrics_reporter.record_scheduler_active()
+        if (
+            self.dllm_config is not None
+            and self.enable_overlap
+            and any(not isinstance(req, TokenizedGenerateReqInput) for req in recv_reqs)
+        ):
+            self.drain_dllm_results()
         self.process_input_requests(recv_reqs)
         return recv_reqs
 
@@ -3497,12 +3505,23 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        if self.dllm_config is not None and self.enable_overlap and last_batch:
+            continuation = self.get_dllm_overlap_batch(last_batch)
+            if continuation is not None:
+                return NextBatchPlan(
+                    batch_to_run=continuation, running_batch=running_batch
+                )
+            last_batch = None  # drain_dllm_results consumed the pending queue
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            # dLLM rows live in the manager, not running_batch. A drained
+            # continuation bypasses the extend-filter below, so recompute
+            # admission capacity rather than retaining its stale full flag.
+            running_batch.batch_is_full = False
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -4221,6 +4240,10 @@ class Scheduler(
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
+        if batch.is_dllm():
+            for req in batch.reqs:
+                req.dllm_inflight += 1
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -4262,7 +4285,7 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if batch.spec_algorithm.is_none():
+                        if batch.spec_algorithm.is_none() and not batch.is_dllm():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -4451,6 +4474,9 @@ class Scheduler(
         batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
+        if batch.is_dllm():
+            self.future_map.stash_dllm(future_indices, batch_result)
+            return
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
@@ -4760,6 +4786,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
+            and self.dllm_manager.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -5159,6 +5186,10 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
+        if self.dllm_config is not None and self.enable_overlap:
+            # Also protect direct handler callers, not only ingest_requests.
+            self.drain_dllm_results()
+
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -5220,6 +5251,14 @@ class Scheduler(
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
                 )
+                assert req.dllm_inflight == 0
+                if req.kv.holds_kv:
+                    # Allocation includes the unresolved block; only completed
+                    # tokens belong to cache_finished_req. Free the rest as tail.
+                    req.kv.kv_committed_len = max(
+                        req.kv.cache_protected_len,
+                        min(req.dllm_committed_end, req.kv.kv_allocated_len),
+                    )
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, is_insert=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -5330,7 +5369,10 @@ class Scheduler(
             # manipulation logic and the accounting bugs that come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        dllm_config = getattr(self, "dllm_config", None)
+        if dllm_config is not None and self.enable_overlap:
+            self.drain_dllm_results()
+        elif self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
@@ -5355,16 +5397,45 @@ class Scheduler(
         ):
             retract_reqs.append(self.chunked_req)
 
+        release_reqs = retract_reqs
+        if dllm_config is not None:
+            # Ingestion may already have cleared last_batch. The manager owns
+            # both active rows and requests admitted without KV yet.
+            retract_reqs = list(
+                dict.fromkeys(
+                    retract_reqs
+                    + [
+                        req
+                        for req in (
+                            self.dllm_manager.waiting_queue
+                            + self.dllm_manager.staging_queue
+                        )
+                        if not req.finished()
+                    ]
+                )
+            )
+            assert all(req.dllm_inflight == 0 for req in retract_reqs)
+            release_reqs = [
+                req for req in retract_reqs if req.kv.holds_kv or req.kv.holds_mamba
+            ]
+            for req in release_reqs:
+                req.kv.kv_committed_len = max(
+                    req.kv.cache_protected_len,
+                    min(req.dllm_committed_end, req.kv.kv_allocated_len),
+                )
+            self.dllm_manager.waiting_queue = []
+            self.dllm_manager.staging_queue = []
+
         self.last_batch = None
         self.cur_batch_for_debug = None
 
-        if retract_reqs:
+        if release_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req
             # would otherwise do; the offloaded copy would be immediately
             # discarded. Non-decode modes ignore offload_kv (they never offload).
             retract_all(
-                reqs=retract_reqs,
+                reqs=release_reqs,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
@@ -5373,6 +5444,12 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
+            if dllm_config is not None:
+                # reset_for_retract does not clear dLLM continuation state.
+                # Re-prefill retained output, suppressing duplicate emission.
+                req.init_diffusion_llm(dllm_config)
+                req.dllm_initialized = False
+                req.dllm_committed_end = len(req.origin_input_ids) + len(req.output_ids)
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()

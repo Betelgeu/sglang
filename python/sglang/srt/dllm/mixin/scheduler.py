@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 from array import array
+from copy import copy
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
+import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -66,6 +68,92 @@ class SchedulerDllmMixin:
         )
         return new_batch
 
+    def drain_dllm_results(self):
+        """Cross a block/control boundary using the ordinary ordered queue."""
+        while self.result_queue:
+            batch, result = self.result_queue.popleft()
+            self.process_batch_result(batch, result)
+        self.last_batch = None
+
+    def get_dllm_overlap_batch(self, last_batch):
+        """Continue one speculative task; ordinary admission handles boundaries.
+
+        FDFO always advances the same block. Once any row has committed, drain
+        its extra task before ordinary scheduling mixes next blocks/new rows.
+        This preserves first-done departure without a GPU-dependent CPU branch
+        in the steady-state denoising path.
+        """
+        block_size = self.dllm_config.block_size
+        fdfo = self.dllm_config.first_done_first_out_mode
+        can_admit = (
+            bool(self.waiting_queue)
+            and len(self.dllm_manager.waiting_queue)
+            < self.dllm_config.max_running_requests
+        )
+        boundary = can_admit or any(
+            req.finished()
+            or req.to_finish is not None
+            or (fdfo and req.dllm_committed_end >= prefix + length)
+            for req, prefix, length in zip(
+                last_batch.reqs, last_batch.prefix_lens, last_batch.extend_lens
+            )
+        )
+        # Full prompt chunks may span multiple blocks. Their regular prefill
+        # transition also goes through admission, after their result is known.
+        boundary |= any(length != block_size for length in last_batch.extend_lens)
+        if not fdfo:
+            needed = len(last_batch.reqs) * block_size
+            boundary |= self.token_to_kv_pool_allocator.available_size() < needed
+            boundary |= any(
+                prefix + length + block_size
+                > self.req_to_token_pool.req_to_token.shape[1]
+                for prefix, length in zip(
+                    last_batch.prefix_lens, last_batch.extend_lens
+                )
+            )
+        if boundary:
+            self.drain_dllm_results()
+            return None
+
+        if fdfo:
+            batch = copy(last_batch)
+            batch.dllm_relay = True
+            batch.dllm_algo_state = None
+            return batch
+
+        # Sync: final prefix KV is ordered before the next forward on the same
+        # stream. Keep it private to this request until actual tokens commit;
+        # never stash mask-valued speculative prefixes into the radix cache.
+        for req, prefix, length in zip(
+            last_batch.reqs, last_batch.prefix_lens, last_batch.extend_lens
+        ):
+            end = prefix + length
+            req.prefix_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, :end
+            ].to(dtype=torch.int64, copy=True)
+            req.dllm_block_offset = end
+            req.set_extend_range(end, end + block_size)
+            missing = end + block_size - len(req.full_untruncated_fill_ids)
+            if missing > 0:
+                req.full_untruncated_fill_ids.extend(
+                    array("q", [self.dllm_config.mask_id] * missing)
+                )
+        batch = ScheduleBatch.init_new(
+            last_batch.reqs[:],
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+            dllm_config=self.dllm_config,
+        )
+        batch.prepare_for_extend()
+        batch.decoding_reqs = None
+        batch.prefill_stats = last_batch.prefill_stats
+        return batch
+
+    @torch.profiler.record_function("dllm/commit_result")
     def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -74,82 +162,58 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        fdfo_mode = self.dllm_config.first_done_first_out_mode
-        assert not fdfo_mode or result.accept_length_per_req_cpu is not None, (
-            "FDFO dLLM result is missing accept lengths."
-        )
+        tokens = result.next_token_ids.cpu().tolist()
+        done = result.dllm_done.cpu().tolist()
+        block_size = self.dllm_config.block_size
+        emitted = []
+        self.token_to_kv_pool_allocator.free_group_begin()
+        for idx, req in enumerate(batch.reqs):
+            req.dllm_inflight -= 1
+            assert req.dllm_inflight >= 0
+            end = batch.prefix_lens[idx] + batch.extend_lens[idx]
+            was_finished = req.finished()
+            if req.to_finish is not None:
+                req.update_finish_state(new_accepted_len=0)
+                if not was_finished:
+                    emitted.append(req)
 
-        # FDFO also commits unresolved blocks so their KV can be reused.
-        if fdfo_mode or result.next_token_ids:
-            block_size = self.dllm_config.block_size
-            algo_states = result.dllm_algo_state
-
-            self.token_to_kv_pool_allocator.free_group_begin()
-            for idx in range(batch.batch_size()):
-                req = batch.reqs[idx]
-
-                if not fdfo_mode:
-                    next_token_ids = result.next_token_ids[idx].tolist()
-                    new_tokens = len(next_token_ids)
-                    if new_tokens == 0:
-                        continue
-
-                    req.full_untruncated_fill_ids[
-                        req.extend_range.end - new_tokens : req.extend_range.end
-                    ] = array("q", next_token_ids)
-                    self.metrics_reporter.num_generated_tokens += new_tokens
-
-                    req.output_ids.extend(next_token_ids)
-                    req.update_finish_state(new_accepted_len=new_tokens)
-
-                    if req.finished():
-                        release_kv_cache(req, self.tree_cache)
-                        req.time_stats.set_completion_time()
-                    continue
-
-                next_token_ids = result.next_token_ids[idx]
-                assert len(next_token_ids) == block_size
-
-                if result.accept_length_per_req_cpu[idx] == 0:
-                    # Unresolved: keep partial state and KV for the next FDFO round.
-                    req.dllm_incomplete_ids = array("q", next_token_ids)
-                    req.dllm_algo_state = (
-                        algo_states[idx] if algo_states is not None else None
+            # n+1 already ran: discard only at commit, retaining resources until
+            # its completion. The snapshot boundary cannot move with req state.
+            if not req.finished() and end > req.dllm_committed_end:
+                if not done[idx]:
+                    req.dllm_incomplete_ids = array("q", tokens[idx])
+                    req.dllm_algo_state = {
+                        name: value[idx]
+                        for name, value in (result.dllm_algo_state or {}).items()
+                    }
+                else:
+                    req.dllm_committed_end = end
+                    req.dllm_incomplete_ids = array("q")
+                    req.dllm_algo_state = None
+                    req.full_untruncated_fill_ids[end - block_size : end] = array(
+                        "q", tokens[idx]
                     )
-                    continue
+                    start = max(0, len(req.origin_input_ids) - (end - block_size))
+                    new_tokens = tokens[idx][start:]
+                    if new_tokens:
+                        req.output_ids.extend(new_tokens)
+                        self.metrics_reporter.num_generated_tokens += len(new_tokens)
+                        req.update_finish_state(new_accepted_len=len(new_tokens))
+                        emitted.append(req)
+                        if req.finished():
+                            req.time_stats.set_completion_time()
 
-                req.dllm_incomplete_ids = array("q")
-                req.dllm_algo_state = None
+            if req.finished() and req.dllm_inflight == 0 and req.kv.holds_kv:
+                # Sync may own an uncommitted next block; abort may own a
+                # partially denoised block. Only committed tokens enter cache.
+                req.kv.kv_committed_len = max(
+                    req.kv.cache_protected_len, req.dllm_committed_end
+                )
+                release_kv_cache(req, self.tree_cache)
 
-                # Mirror the resolved block into the committed fill ids so the
-                # prefix cache keys on the real tokens, not the mask block, next
-                # round. Index relative to extend_range.end (the truncated/
-                # committed length), which can be shorter than
-                # full_untruncated_fill_ids when the staging adder truncates the
-                # block to the KV budget.
-                req.full_untruncated_fill_ids[
-                    req.extend_range.end - block_size : req.extend_range.end
-                ] = array("q", next_token_ids)
-
-                len_input = len(req.origin_input_ids)
-                len_fill = req.extend_range.end
-                if len_fill <= len_input:
-                    continue
-
-                if len_fill - len(next_token_ids) < len_input:
-                    next_token_ids = next_token_ids[len_input - len_fill :]
-
-                self.metrics_reporter.num_generated_tokens += len(next_token_ids)
-                req.output_ids.extend(next_token_ids)
-                req.update_finish_state(new_accepted_len=len(next_token_ids))
-
-                if req.finished():
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
-            self.token_to_kv_pool_allocator.free_group_end()
-
+        if emitted:
+            self.output_streamer.stream_output(emitted, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
