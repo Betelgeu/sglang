@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -90,6 +89,11 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    if batch.dllm_relay:
+        ids, batch.dllm_algo_state = future_map.resolve_dllm(batch.req_pool_indices)
+        batch.input_ids = ids.flatten()
+        batch.prefill_input_ids_cpu = None
+        return
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
@@ -297,6 +301,8 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
+        self.dllm_tokens = None
+        self.dllm_states = {}
         self.need_topk = False
         self.need_hidden_states = False
         self.topk_p_buf = None
@@ -319,6 +325,29 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+
+    def stash_dllm(self, indices: torch.Tensor, result) -> None:
+        """Publish block tokens and tensor state on the forward stream.
+
+        index_copy_ owns the published values; subsequent steps and D2H do not
+        alias the pool buffers. New blocks overwrite every field before reuse.
+        """
+        tokens = result.next_token_ids
+        if self.dllm_tokens is None:
+            self.dllm_tokens = tokens.new_empty((self.req_pool_size, *tokens.shape[1:]))
+        self.dllm_tokens.index_copy_(0, indices, tokens)
+        for name, value in (result.dllm_algo_state or {}).items():
+            if name not in self.dllm_states:
+                self.dllm_states[name] = value.new_empty(
+                    (self.req_pool_size, *value.shape[1:])
+                )
+            self.dllm_states[name].index_copy_(0, indices, value)
+
+    def resolve_dllm(self, indices: torch.Tensor):
+        return self.dllm_tokens.index_select(0, indices), {
+            name: value.index_select(0, indices)
+            for name, value in self.dllm_states.items()
+        }
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
-
 from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
@@ -289,7 +288,11 @@ def _release_overallocated_kv_indices(
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not get_serving().strip_thinking_cache:
+    if (
+        spec_algo is None
+        and not req.is_dllm()
+        and not get_serving().strip_thinking_cache
+    ):
         assert start_p == end_p, (
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )

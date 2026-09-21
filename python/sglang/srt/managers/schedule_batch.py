@@ -78,7 +78,6 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
-
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
     append_beam_tail,
@@ -2342,6 +2341,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    dllm_relay: bool = False
+    dllm_algo_state: Optional[dict[str, torch.Tensor]] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -3599,6 +3600,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            dllm_config=self.dllm_config,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,

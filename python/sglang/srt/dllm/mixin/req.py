@@ -22,6 +22,10 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        # Committed block boundary and outstanding result count. GPU state lives
+        # in FutureMap; these fields only protect commit and resource lifetime.
+        self.dllm_committed_end = 0
+        self.dllm_inflight = 0
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
