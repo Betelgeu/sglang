@@ -1750,9 +1750,13 @@ def _dllm_overlap_disable(view: Any) -> dict:
         return {}
     if view.disable_overlap_schedule:
         return {}
-    logger.warning(
-        "Overlap schedule is disabled because of using diffusion LLM inference"
-    )
+    if (
+        view.dllm_algorithm in ("LowConfidence", "JointThreshold")
+        and view.tp_size == 1
+        and view.pp_size == 1
+    ):
+        return {}
+    logger.warning("Overlap schedule is disabled for this dLLM configuration")
     return {"disable_overlap_schedule": True}
 
 
