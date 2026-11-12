@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Cloud Agent bootstrap for SGLang on a CPU VM.
+#
+# NVIDIA GPU wheels cannot run here. This script installs the repository's CPU
+# engine (python/pyproject_cpu.toml plus the CPU kernel) into .venv without
+# leaving the CUDA pyproject.toml files modified.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+VENV="$ROOT/.venv"
+BACKUP_DIR="$VENV/pyproject-backup"
+PYPROJECT="$ROOT/python/pyproject.toml"
+PYPROJECT_CPU="$ROOT/python/pyproject_cpu.toml"
+KERNEL_DIR="$ROOT/python/sglang/kernels/aot"
+KERNEL_PYPROJECT="$KERNEL_DIR/pyproject.toml"
+KERNEL_PYPROJECT_CPU="$KERNEL_DIR/pyproject_cpu.toml"
+BAK_PY="$BACKUP_DIR/python-pyproject.toml"
+BAK_KERNEL="$BACKUP_DIR/kernel-pyproject.toml"
+ENV_FILE="/etc/profile.d/sglang-cpu.sh"
+WRAPPER="/usr/local/bin/sglang"
+
+export DEBIAN_FRONTEND=noninteractive
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+# uv 0.13 defaults the PyTorch index to a CUDA backend. Cloud Agent VMs have no
+# NVIDIA GPU, so force the CPU wheels for torch, torchvision, torchaudio, and triton.
+export UV_TORCH_BACKEND=cpu
+export UV_PRERELEASE="allow"
+
+restore_pyprojects() {
+  if [ -f "$BAK_PY" ]; then
+    cp "$BAK_PY" "$PYPROJECT"
+    rm -f "$BAK_PY"
+  fi
+  if [ -f "$BAK_KERNEL" ]; then
+    cp "$BAK_KERNEL" "$KERNEL_PYPROJECT"
+    rm -f "$BAK_KERNEL"
+  fi
+}
+trap restore_pyprojects EXIT
+
+echo "==> system packages"
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  build-essential \
+  ninja-build \
+  python3-dev \
+  python3-venv \
+  libnuma-dev \
+  numactl \
+  libtbb-dev \
+  libgoogle-perftools-dev \
+  pkg-config \
+  ca-certificates \
+  curl \
+  git
+
+echo "==> uv"
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+if [ -x "$HOME/.local/bin/uv" ]; then
+  sudo ln -sfn "$HOME/.local/bin/uv" /usr/local/bin/uv
+  if [ -x "$HOME/.local/bin/uvx" ]; then
+    sudo ln -sfn "$HOME/.local/bin/uvx" /usr/local/bin/uvx
+  fi
+fi
+hash -r
+command -v uv
+uv --version
+
+echo "==> virtualenv"
+uv venv "$VENV" --python /usr/bin/python3 --allow-existing
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+
+echo "==> CPU torch"
+if ! "$VENV/bin/python" -c 'import torch,torchvision,torchaudio; raise SystemExit(0 if torch.__version__.startswith("2.12.0") and torch.__version__.endswith("+cpu") and torchvision.__version__.startswith("0.27.0") and torchaudio.__version__.startswith("2.11.0") else 1)' >/dev/null 2>&1; then
+  uv pip install --python "$VENV/bin/python" --reinstall --torch-backend cpu \
+    "torch==2.12.0" \
+    "torchvision==0.27.0" \
+    "torchaudio==2.11.0"
+fi
+
+if ! "$VENV/bin/python" -c 'import triton; raise SystemExit(0 if triton.__version__=="3.7.0" else 1)' >/dev/null 2>&1; then
+  if ! uv pip install --python "$VENV/bin/python" --reinstall --torch-backend cpu "triton==3.7.0"; then
+    echo "CPU triton wheel unavailable; installing the PyPI build"
+    UV_TORCH_BACKEND=auto uv pip install --python "$VENV/bin/python" --reinstall \
+      "triton==3.7.0" --index-url "https://pypi.org/simple"
+  fi
+fi
+
+TORCH_VERSION="$("$VENV/bin/python" -c 'import torch; print(torch.__version__)')"
+echo "torch ${TORCH_VERSION}"
+case "$TORCH_VERSION" in
+  *+cpu) ;;
+  *)
+    echo "expected a CPU torch build, got ${TORCH_VERSION}" >&2
+    exit 1
+    ;;
+esac
+
+TORCH_CONSTRAINTS="$VENV/cpu-constraints.txt"
+cat >"$TORCH_CONSTRAINTS" <<EOF
+torch==${TORCH_VERSION}
+EOF
+VISION_VERSION="$("$VENV/bin/python" -c 'import torchvision; print(torchvision.__version__)')"
+AUDIO_VERSION="$("$VENV/bin/python" -c 'import torchaudio; print(torchaudio.__version__)')"
+cat >>"$TORCH_CONSTRAINTS" <<EOF
+torchvision==${VISION_VERSION}
+torchaudio==${AUDIO_VERSION}
+EOF
+
+echo "==> sglang CPU package"
+mkdir -p "$BACKUP_DIR"
+restore_pyprojects
+cp "$PYPROJECT" "$BAK_PY"
+cp "$PYPROJECT_CPU" "$PYPROJECT"
+uv pip install --python "$VENV/bin/python" -e "$ROOT/python" \
+  --constraint "$TORCH_CONSTRAINTS"
+restore_pyprojects
+
+echo "==> CPU kernels"
+if "$VENV/bin/python" -c "import sgl_kernel" >/dev/null 2>&1; then
+  echo "sgl_kernel already importable; skipping the kernel build"
+else
+  uv pip install --python "$VENV/bin/python" "scikit-build-core>=0.10" "cmake" "ninja" "wheel"
+  mkdir -p "$BACKUP_DIR"
+  restore_pyprojects
+  cp "$KERNEL_PYPROJECT" "$BAK_KERNEL"
+  cp "$KERNEL_PYPROJECT_CPU" "$KERNEL_PYPROJECT"
+  VIRTUAL_ENV="$VENV" uv pip install --python "$VENV/bin/python" "$KERNEL_DIR" \
+    --no-build-isolation \
+    --constraint "$TORCH_CONSTRAINTS"
+  restore_pyprojects
+fi
+
+if ! git diff --quiet -- "$PYPROJECT" "$KERNEL_PYPROJECT"; then
+  echo "tracked pyproject files were left modified" >&2
+  git diff --stat -- "$PYPROJECT" "$KERNEL_PYPROJECT" >&2
+  exit 1
+fi
+
+export VIRTUAL_ENV="$VENV"
+IOMP="$("$VENV/bin/python" - <<'PY'
+import glob
+import os
+
+venv = os.environ["VIRTUAL_ENV"]
+matches = glob.glob(os.path.join(venv, "**", "libiomp5.so*"), recursive=True)
+print(matches[0] if matches else "")
+PY
+)"
+
+{
+  echo "# Generated by .cursor/install.sh. CPU SGLang runtime for login shells."
+  echo "case \":\$PATH:\" in"
+  echo "  *\":$VENV/bin\":*) ;;"
+  echo "  *) export PATH=\"$VENV/bin:\$PATH\" ;;"
+  echo "esac"
+  echo "export VIRTUAL_ENV=\"$VENV\""
+  echo "export SGLANG_USE_CPU_ENGINE=1"
+  if [ -n "$IOMP" ]; then
+    IOMP_DIR="$(dirname "$IOMP")"
+    echo "case \":\${LD_LIBRARY_PATH:-}:\" in"
+    echo "  *\":$IOMP_DIR:\"*) ;;"
+    echo "  *) export LD_LIBRARY_PATH=\"$IOMP_DIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\" ;;"
+    echo "esac"
+  fi
+} | sudo tee "$ENV_FILE" >/dev/null
+sudo chmod 644 "$ENV_FILE"
+
+sudo tee "$WRAPPER" >/dev/null <<EOF
+#!/bin/bash
+set -euo pipefail
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+exec "$VENV/bin/sglang" "\$@"
+EOF
+sudo chmod 755 "$WRAPPER"
+
+BASHRC_MARKER="# sglang-cpu-dev-env"
+if [ -f "$HOME/.bashrc" ] && ! grep -q "$BASHRC_MARKER" "$HOME/.bashrc"; then
+  printf '\n%s\n[ -f %s ] && . %s\n' "$BASHRC_MARKER" "$ENV_FILE" "$ENV_FILE" >>"$HOME/.bashrc"
+fi
+
+echo "==> import check"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+"$VENV/bin/sglang" version
+"$VENV/bin/python" -c "import sglang, sgl_kernel, torch; print('sglang', sglang.__version__); print('torch', torch.__version__, torch.__file__)"
+echo "install complete"

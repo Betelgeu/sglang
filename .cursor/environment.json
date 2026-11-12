@@ -1,0 +1,4 @@
+{
+  "name": "sglang",
+  "install": "bash .cursor/install.sh"
+}
